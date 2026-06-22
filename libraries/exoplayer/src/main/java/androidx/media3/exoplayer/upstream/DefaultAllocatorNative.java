@@ -192,7 +192,7 @@ public final class DefaultAllocatorNative {
   @FastNative
   private static native Allocation nativeCreateAllocation(int size);
 
-  @CriticalNative
+  @FastNative
   private static native void nativeFreeAllocation(long handle);
 
   private DefaultAllocatorNative() {}

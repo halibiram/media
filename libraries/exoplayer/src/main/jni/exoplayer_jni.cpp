@@ -50,8 +50,10 @@ jobject createAllocation(JNIEnv *env, jclass clazz, jint size) {
   return allocation;
 }
 
-// CriticalNative optimization: No JNIEnv* or jclass!
-void freeAllocation(jlong handle) {
+// Declared @FastNative on the Java side. FastNative keeps the standard JNI ABI.
+void freeAllocation(JNIEnv *env, jclass clazz, jlong handle) {
+  (void)env;
+  (void)clazz;
   if (handle != 0) {
     free(reinterpret_cast<void *>(handle));
   }
@@ -97,7 +99,11 @@ jboolean copyBetweenDirectBuffers(JNIEnv *env, jclass clazz, jobject source, jin
   return JNI_TRUE;
 }
 
-void nativeCopyAddresses(jlong sourceAddr, jint sourceOffset, jlong targetAddr, jint targetOffset, jint length) {
+// Declared @FastNative on the Java side. FastNative keeps the standard JNI ABI.
+void nativeCopyAddresses(JNIEnv *env, jclass clazz, jlong sourceAddr, jint sourceOffset,
+                         jlong targetAddr, jint targetOffset, jint length) {
+  (void)env;
+  (void)clazz;
   if (sourceAddr != 0 && targetAddr != 0 && length > 0) {
     std::memcpy(reinterpret_cast<uint8_t *>(targetAddr) + targetOffset,
                 reinterpret_cast<const uint8_t *>(sourceAddr) + sourceOffset,

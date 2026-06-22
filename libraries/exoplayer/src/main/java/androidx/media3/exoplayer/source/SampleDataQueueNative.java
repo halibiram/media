@@ -110,7 +110,7 @@ public final class SampleDataQueueNative {
   private static native boolean nativeCopyBetweenDirectBuffers(
       ByteBuffer source, int sourceOffset, ByteBuffer target, int targetOffset, int length);
 
-  @CriticalNative
+  @FastNative
   public static native void nativeCopyAddresses(
       long sourceAddr, int sourceOffset, long targetAddr, int targetOffset, int length);
 
