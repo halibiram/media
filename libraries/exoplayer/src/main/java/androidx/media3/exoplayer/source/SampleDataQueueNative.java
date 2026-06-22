@@ -1,7 +1,6 @@
 package androidx.media3.exoplayer.source;
 
 import java.nio.ByteBuffer;
-import dalvik.annotation.optimization.CriticalNative;
 import dalvik.annotation.optimization.FastNative;
 
 public final class SampleDataQueueNative {
@@ -110,25 +109,27 @@ public final class SampleDataQueueNative {
   private static native boolean nativeCopyBetweenDirectBuffers(
       ByteBuffer source, int sourceOffset, ByteBuffer target, int targetOffset, int length);
 
-  @CriticalNative
+  // @FastNative (not @CriticalNative): FastNative keeps the standard JNI ABI and
+  // therefore stays correct on devices/runtimes that do not honor the annotation.
+  @FastNative
   public static native void nativeCopyAddresses(
       long sourceAddr, int sourceOffset, long targetAddr, int targetOffset, int length);
 
-  private static final java.lang.reflect.Field ADDRESS_FIELD;
-  static {
-    java.lang.reflect.Field field = null;
-    try {
-      field = java.nio.Buffer.class.getDeclaredField("address");
-      field.setAccessible(true);
-    } catch (Exception e) {}
-    ADDRESS_FIELD = field;
-  }
+  // Resolves a direct buffer's off-heap address via JNI GetDirectBufferAddress.
+  @FastNative
+  private static native long nativeGetBufferAddress(ByteBuffer buffer);
 
   public static long getDirectBufferAddress(ByteBuffer buffer) {
-    if (ADDRESS_FIELD == null) return 0L;
+    if (buffer == null || !buffer.isDirect() || !isAvailable()) {
+      return 0L;
+    }
     try {
-      return ADDRESS_FIELD.getLong(buffer);
-    } catch (Exception e) {
+      // Use the public JNI API instead of reflecting on the hidden
+      // java.nio.Buffer.address field, which is blocked by non-SDK interface
+      // restrictions on API 28+ and silently disabled zero-copy there.
+      return nativeGetBufferAddress(buffer);
+    } catch (UnsatisfiedLinkError e) {
+      isAvailable = false;
       return 0L;
     }
   }

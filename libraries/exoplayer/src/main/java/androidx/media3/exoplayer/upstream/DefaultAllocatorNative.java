@@ -6,7 +6,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-import dalvik.annotation.optimization.CriticalNative;
 import dalvik.annotation.optimization.FastNative;
 
 public final class DefaultAllocatorNative {
@@ -24,7 +23,12 @@ public final class DefaultAllocatorNative {
       });
 
   private static final int ARENA_CHUNK_SIZE = 65536;
+
+  // Desired arena: 512 chunks (32 MB). This ceiling is preserved on every device
+  // that can allocate it, so devices that already worked are unaffected.
   private static final int ARENA_MAX_CHUNKS = 512;
+  // Lower bound (4 MB) before giving up and using the per-allocation direct path.
+  private static final int ARENA_MIN_CHUNKS = 64;
 
   private static final java.util.Queue<Allocation> arenaPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
   private static volatile long arenaBaseAddress = 0L;
@@ -40,31 +44,45 @@ public final class DefaultAllocatorNative {
     if (!isAvailable()) {
       return;
     }
-    int totalSize = ARENA_MAX_CHUNKS * ARENA_CHUNK_SIZE;
-    try {
-      arenaBaseAllocation = nativeCreateAllocation(totalSize);
-      if (arenaBaseAllocation == null || arenaBaseAllocation.buffer == null) {
-        return;
+    // Try the full 32 MB arena first. Only step down if the contiguous off-heap
+    // block genuinely fails to allocate (constrained / fragmented / 32-bit
+    // devices). Devices that can allocate the full block keep the full arena,
+    // so anything that already worked is byte-for-byte unaffected.
+    int chunks = ARENA_MAX_CHUNKS;
+    Allocation base = null;
+    while (chunks >= ARENA_MIN_CHUNKS) {
+      try {
+        base = nativeCreateAllocation(chunks * ARENA_CHUNK_SIZE);
+      } catch (Exception | UnsatisfiedLinkError e) {
+        base = null;
       }
-      arenaBaseAddress = arenaBaseAllocation.nativeHandle;
-      arenaEndAddress = arenaBaseAddress + totalSize;
-
-      java.nio.ByteBuffer baseBuffer = arenaBaseAllocation.buffer;
-      for (int i = 0; i < ARENA_MAX_CHUNKS; i++) {
-        int offset = i * ARENA_CHUNK_SIZE;
-
-        // Slice the base buffer for this chunk
-        java.nio.ByteBuffer chunkBuffer = baseBuffer.duplicate();
-        chunkBuffer.position(offset);
-        chunkBuffer.limit(offset + ARENA_CHUNK_SIZE);
-        java.nio.ByteBuffer sliced = chunkBuffer.slice();
-
-        long chunkAddress = arenaBaseAddress + offset;
-        Allocation chunkAllocation = new Allocation(sliced, 0, chunkAddress);
-        arenaPool.offer(chunkAllocation);
+      if (base != null && base.buffer != null) {
+        break;
       }
-    } catch (Exception | UnsatisfiedLinkError e) {
-      // Fallback in case of failures
+      base = null;
+      chunks >>= 1; // Halve and retry only on failure.
+    }
+    if (base == null) {
+      return; // Fall back to the per-allocation direct path.
+    }
+
+    arenaBaseAllocation = base;
+    arenaBaseAddress = base.nativeHandle;
+    arenaEndAddress = arenaBaseAddress + (long) chunks * ARENA_CHUNK_SIZE;
+
+    java.nio.ByteBuffer baseBuffer = base.buffer;
+    for (int i = 0; i < chunks; i++) {
+      int offset = i * ARENA_CHUNK_SIZE;
+
+      // Slice the base buffer for this chunk
+      java.nio.ByteBuffer chunkBuffer = baseBuffer.duplicate();
+      chunkBuffer.position(offset);
+      chunkBuffer.limit(offset + ARENA_CHUNK_SIZE);
+      java.nio.ByteBuffer sliced = chunkBuffer.slice();
+
+      long chunkAddress = arenaBaseAddress + offset;
+      Allocation chunkAllocation = new Allocation(sliced, 0, chunkAddress);
+      arenaPool.offer(chunkAllocation);
     }
   }
 
@@ -156,7 +174,10 @@ public final class DefaultAllocatorNative {
     long now = System.currentTimeMillis();
     PendingDeallocation pending;
     while ((pending = pendingDeallocations.peek()) != null) {
-      if (!forceAll && (now - pending.timestamp < 2000)) {
+      // Shorter retention window (was 2000ms) so off-heap memory is reclaimed
+      // promptly. Off-heap memory is not visible to the GC, so a long deferral
+      // let native usage balloon during high-bitrate playback on small devices.
+      if (!forceAll && (now - pending.timestamp < 200)) {
         break;
       }
       pendingDeallocations.poll();
@@ -192,7 +213,11 @@ public final class DefaultAllocatorNative {
   @FastNative
   private static native Allocation nativeCreateAllocation(int size);
 
-  @CriticalNative
+  // @FastNative (not @CriticalNative): FastNative uses the standard JNI ABI, so
+  // it stays correct on devices/runtimes that do not honor the annotation, while
+  // CriticalNative changes the native calling convention and corrupted the
+  // handle argument (freeing a garbage pointer) wherever it was not applied.
+  @FastNative
   private static native void nativeFreeAllocation(long handle);
 
   private DefaultAllocatorNative() {}

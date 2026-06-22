@@ -10,14 +10,19 @@ namespace {
 
 jclass gAllocationClass = nullptr;
 jmethodID gAllocationConstructor = nullptr;
-size_t gPageAlignment = 4096;
+
+// NewDirectByteBuffer does not require page alignment. A 64-byte (cache line /
+// SIMD friendly) alignment keeps the off-heap fast paths fast while avoiding the
+// large per-allocation internal fragmentation that full page alignment caused on
+// 16 KB-page and low-RAM devices.
+constexpr size_t kBufferAlignment = 64;
 
 void *allocateZeroedMemory(jint size) {
   void *memory = nullptr;
   if (size <= 0) {
     return nullptr;
   }
-  if (posix_memalign(&memory, gPageAlignment, static_cast<size_t>(size)) != 0) {
+  if (posix_memalign(&memory, kBufferAlignment, static_cast<size_t>(size)) != 0) {
     return nullptr;
   }
   std::memset(memory, 0, static_cast<size_t>(size));
@@ -50,8 +55,14 @@ jobject createAllocation(JNIEnv *env, jclass clazz, jint size) {
   return allocation;
 }
 
-// CriticalNative optimization: No JNIEnv* or jclass!
-void freeAllocation(jlong handle) {
+// Declared @FastNative on the Java side. FastNative keeps the standard JNI ABI
+// (JNIEnv*, jclass, args...), so the call is correct even on runtimes/devices
+// that do not honor the optimization annotation. The previous @CriticalNative
+// variant omitted these parameters, which corrupted the argument layout (and
+// freed a garbage pointer) on any device where CriticalNative was not applied.
+void freeAllocation(JNIEnv *env, jclass clazz, jlong handle) {
+  (void)env;
+  (void)clazz;
   if (handle != 0) {
     free(reinterpret_cast<void *>(handle));
   }
@@ -97,12 +108,28 @@ jboolean copyBetweenDirectBuffers(JNIEnv *env, jclass clazz, jobject source, jin
   return JNI_TRUE;
 }
 
-void nativeCopyAddresses(jlong sourceAddr, jint sourceOffset, jlong targetAddr, jint targetOffset, jint length) {
+// Declared @FastNative on the Java side (standard JNI ABI). See freeAllocation.
+void nativeCopyAddresses(JNIEnv *env, jclass clazz, jlong sourceAddr, jint sourceOffset,
+                         jlong targetAddr, jint targetOffset, jint length) {
+  (void)env;
+  (void)clazz;
   if (sourceAddr != 0 && targetAddr != 0 && length > 0) {
     std::memcpy(reinterpret_cast<uint8_t *>(targetAddr) + targetOffset,
                 reinterpret_cast<const uint8_t *>(sourceAddr) + sourceOffset,
                 static_cast<size_t>(length));
   }
+}
+
+// Returns the off-heap address of a direct ByteBuffer via the public JNI API.
+// Replaces reflection on the hidden java.nio.Buffer.address field, which is
+// blocked by non-SDK interface restrictions on API 28+ and silently disabled
+// the zero-copy fast path on those devices.
+jlong getBufferAddress(JNIEnv *env, jclass clazz, jobject buffer) {
+  (void)clazz;
+  if (buffer == nullptr) {
+    return 0;
+  }
+  return reinterpret_cast<jlong>(env->GetDirectBufferAddress(buffer));
 }
 
 // Registration tables
@@ -115,7 +142,8 @@ const JNINativeMethod gQueueMethods[] = {
     {"nativeCopyFromArray", "([BILjava/nio/ByteBuffer;II)Z", reinterpret_cast<void *>(copyFromArray)},
     {"nativeCopyToArray", "(Ljava/nio/ByteBuffer;I[BII)Z", reinterpret_cast<void *>(copyToArray)},
     {"nativeCopyBetweenDirectBuffers", "(Ljava/nio/ByteBuffer;ILjava/nio/ByteBuffer;II)Z", reinterpret_cast<void *>(copyBetweenDirectBuffers)},
-    {"nativeCopyAddresses", "(JIJII)V", reinterpret_cast<void *>(nativeCopyAddresses)}
+    {"nativeCopyAddresses", "(JIJII)V", reinterpret_cast<void *>(nativeCopyAddresses)},
+    {"nativeGetBufferAddress", "(Ljava/nio/ByteBuffer;)J", reinterpret_cast<void *>(getBufferAddress)}
 };
 
 } // namespace
@@ -126,11 +154,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
   JNIEnv *env = nullptr;
   if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
     return JNI_ERR;
-  }
-
-  long pageSize = sysconf(_SC_PAGESIZE);
-  if (pageSize > 0) {
-    gPageAlignment = static_cast<size_t>(pageSize);
   }
 
   // Find Allocation class
