@@ -1,11 +1,6 @@
 package androidx.media3.exoplayer.upstream;
 
 import androidx.annotation.Nullable;
-import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-
 import dalvik.annotation.optimization.FastNative;
 
 public final class DefaultAllocatorNative {
@@ -15,12 +10,7 @@ public final class DefaultAllocatorNative {
   private static volatile boolean loadAttempted;
   private static volatile boolean isAvailable;
 
-  private static final ScheduledExecutorService scheduler =
-      Executors.newSingleThreadScheduledExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "NuvioNativeAllocatorDeallocator");
-        thread.setDaemon(true);
-        return thread;
-      });
+
 
   private static final int ARENA_CHUNK_SIZE = 65536;
 
@@ -115,22 +105,6 @@ public final class DefaultAllocatorNative {
     return createAllocationDirect(size);
   }
 
-  private static final class PendingDeallocation {
-    final long handle;
-    final long timestamp;
-
-    PendingDeallocation(long handle, long timestamp) {
-      this.handle = handle;
-      this.timestamp = timestamp;
-    }
-  }
-
-  private static final java.util.Queue<PendingDeallocation> pendingDeallocations =
-      new java.util.concurrent.ConcurrentLinkedQueue<>();
-
-  private static final java.util.concurrent.atomic.AtomicBoolean deallocatorRunning =
-      new java.util.concurrent.atomic.AtomicBoolean(false);
-
   public static void freeAllocation(Allocation allocation) {
     final long nativeHandle = allocation.nativeHandle;
     if (nativeHandle == 0) {
@@ -145,47 +119,11 @@ public final class DefaultAllocatorNative {
       return;
     }
 
-    allocation.nativeHandle = 0; // Clear immediately to prevent double-free queueing
-    pendingDeallocations.offer(new PendingDeallocation(nativeHandle, System.currentTimeMillis()));
-    scheduleDeallocatorIfNeeded();
-  }
-
-  private static void scheduleDeallocatorIfNeeded() {
-    if (deallocatorRunning.compareAndSet(false, true)) {
-      try {
-        scheduler.schedule(DefaultAllocatorNative::runDeallocator, 500, TimeUnit.MILLISECONDS);
-      } catch (RejectedExecutionException e) {
-        deallocatorRunning.set(false);
-        // Fallback: drain immediately if scheduler is shut down
-        drainPendingDeallocations(true);
-      }
-    }
-  }
-
-  private static void runDeallocator() {
-    deallocatorRunning.set(false);
-    drainPendingDeallocations(false);
-    if (!pendingDeallocations.isEmpty()) {
-      scheduleDeallocatorIfNeeded();
-    }
-  }
-
-  private static void drainPendingDeallocations(boolean forceAll) {
-    long now = System.currentTimeMillis();
-    PendingDeallocation pending;
-    while ((pending = pendingDeallocations.peek()) != null) {
-      // Shorter retention window (was 2000ms) so off-heap memory is reclaimed
-      // promptly. Off-heap memory is not visible to the GC, so a long deferral
-      // let native usage balloon during high-bitrate playback on small devices.
-      if (!forceAll && (now - pending.timestamp < 200)) {
-        break;
-      }
-      pendingDeallocations.poll();
-      try {
-        nativeFreeAllocation(pending.handle);
-      } catch (UnsatisfiedLinkError e) {
-        isAvailable = false;
-      }
+    allocation.nativeHandle = 0; // Clear immediately
+    try {
+      nativeFreeAllocation(nativeHandle);
+    } catch (UnsatisfiedLinkError e) {
+      isAvailable = false;
     }
   }
 
