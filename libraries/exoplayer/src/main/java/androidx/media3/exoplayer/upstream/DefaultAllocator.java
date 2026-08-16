@@ -35,6 +35,7 @@ public final class DefaultAllocator implements Allocator {
   private final int individualAllocationSize;
   private final boolean forceNativeAllocation;
   @Nullable private final byte[] initialAllocationBlock;
+  private final @NullableType Allocation[] initialAllocations;
 
   private int targetBufferSize;
   private int allocatedCount;
@@ -89,13 +90,26 @@ public final class DefaultAllocator implements Allocator {
     this.forceNativeAllocation = forceNativeAllocation;
     this.availableCount = initialAllocationCount;
     this.availableAllocations = new Allocation[initialAllocationCount + AVAILABLE_EXTRA_CAPACITY];
-    if (initialAllocationCount > 0) {
-      initialAllocationBlock = null;
+    boolean useNativeAllocation =
+        forceNativeAllocation || NuvioEngineConfig.get().isNativeAllocationEnabled();
+    if (initialAllocationCount > 0 && !useNativeAllocation) {
+      initialAllocationBlock = new byte[initialAllocationCount * individualAllocationSize];
+      initialAllocations = null;
       for (int i = 0; i < initialAllocationCount; i++) {
-        availableAllocations[i] = createAllocation(individualAllocationSize);
+        availableAllocations[i] =
+            new Allocation(initialAllocationBlock, i * individualAllocationSize);
+      }
+    } else if (initialAllocationCount > 0) {
+      initialAllocationBlock = null;
+      initialAllocations = new Allocation[initialAllocationCount];
+      for (int i = 0; i < initialAllocationCount; i++) {
+        Allocation allocation = createAllocation(individualAllocationSize);
+        availableAllocations[i] = allocation;
+        initialAllocations[i] = allocation;
       }
     } else {
       initialAllocationBlock = null;
+      initialAllocations = null;
     }
   }
 
@@ -136,9 +150,6 @@ public final class DefaultAllocator implements Allocator {
   public synchronized void release(Allocation allocation) {
     availableAllocations[availableCount++] = allocation;
     allocatedCount--;
-    if (targetBufferSize == 0 || shouldTrim()) {
-      trim();
-    }
     // Wake up threads waiting for the allocated size to drop.
     notifyAll();
   }
@@ -149,9 +160,6 @@ public final class DefaultAllocator implements Allocator {
       availableAllocations[availableCount++] = allocationNode.getAllocation();
       allocatedCount--;
       allocationNode = allocationNode.next();
-    }
-    if (targetBufferSize == 0 || shouldTrim()) {
-      trim();
     }
     // Wake up threads waiting for the allocated size to drop.
     notifyAll();
@@ -166,19 +174,18 @@ public final class DefaultAllocator implements Allocator {
       return;
     }
 
-    if (initialAllocationBlock != null) {
-      // Some allocations are backed by an initial block. We need to make sure that we hold onto all
-      // such allocations. Re-order the available allocations so that the ones backed by the initial
-      // block come first.
+    if (initialAllocationBlock != null || initialAllocations != null) {
+      // Some allocations were created up front. Re-order the available allocations so that they
+      // come first and are retained when trimming.
       int lowIndex = 0;
       int highIndex = availableCount - 1;
       while (lowIndex <= highIndex) {
         Allocation lowAllocation = Assertions.checkNotNull(availableAllocations[lowIndex]);
-        if (lowAllocation.data == initialAllocationBlock) {
+        if (isInitialAllocation(lowAllocation)) {
           lowIndex++;
         } else {
           Allocation highAllocation = Assertions.checkNotNull(availableAllocations[highIndex]);
-          if (highAllocation.data != initialAllocationBlock) {
+          if (!isInitialAllocation(highAllocation)) {
             highIndex--;
           } else {
             availableAllocations[lowIndex++] = highAllocation;
@@ -233,18 +240,25 @@ public final class DefaultAllocator implements Allocator {
         : new Allocation(java.nio.ByteBuffer.allocateDirect(size), 0);
   }
 
+  private boolean isInitialAllocation(Allocation allocation) {
+    if (initialAllocationBlock != null && allocation.data == initialAllocationBlock) {
+      return true;
+    }
+    if (initialAllocations != null) {
+      for (Allocation initialAllocation : initialAllocations) {
+        if (allocation == initialAllocation) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   private static void freeAllocation(Allocation allocation) {
     if (allocation.nativeHandle != 0) {
       DefaultAllocatorNative.freeAllocation(allocation);
     }
   }
 
-  private boolean shouldTrim() {
-    int targetAllocationCount = Util.ceilDivide(targetBufferSize, individualAllocationSize);
-    int targetAvailableCount = max(0, targetAllocationCount - allocatedCount);
-    // Add a damping factor of 16 segments (4 MB) to prevent allocation thrashing (memory churn)
-    // on the hot playback path while still ensuring memory is released once we accumulate a surplus.
-    return availableCount > (targetAvailableCount + 16);
-  }
 
 }
