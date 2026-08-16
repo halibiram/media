@@ -405,7 +405,7 @@ public final class MediaCodecUtil {
         int profile = codecProfileAndLevel.first;
         if (profile == CodecProfileLevel.DolbyVisionProfileDvheDtr
             || profile == CodecProfileLevel.DolbyVisionProfileDvheSt
-            || (mapDV7ToHevc && profile == CodecProfileLevel.DolbyVisionProfileDvheDen)) {
+            || (mapDV7ToHevc && profile == CodecProfileLevel.DolbyVisionProfileDvheDtb)) {
           return MimeTypes.VIDEO_H265;
         } else if (profile == CodecProfileLevel.DolbyVisionProfileDvavSe) {
           return MimeTypes.VIDEO_H264;
