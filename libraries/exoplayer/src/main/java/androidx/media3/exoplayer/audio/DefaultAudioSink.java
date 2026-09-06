@@ -1037,6 +1037,12 @@ public final class DefaultAudioSink implements AudioSink {
           // For TrueHD this can occur after some seek operations, as not every sample starts with
           // a syncframe header. If we chunked samples together so the extracted samples always
           // started with a syncframe header, the chunks would be too large.
+          // The dropped buffer may have been the one that set startMediaTimeUs (the first after
+          // a flush), and nothing is counted for it, so the media time would run early by the
+          // dropped span for the rest of the stream. TrueHD allows up to 128 access units
+          // (~107 ms) between syncframes, which is inside the discontinuity tolerance below, so
+          // that path would never correct it. Re-read the anchor from the next accepted buffer.
+          startMediaTimeUsNeedsSync = true;
           return true;
         }
       }
