@@ -22,6 +22,7 @@ import static androidx.media3.common.C.AUXILIARY_TRACK_TYPE_UNDEFINED;
 import static androidx.media3.common.util.Assertions.checkNotNull;
 import static androidx.media3.common.util.Assertions.checkState;
 import static androidx.media3.common.util.Assertions.checkStateNotNull;
+import static androidx.media3.common.util.Util.binarySearchFloor;
 import static androidx.media3.common.util.Util.castNonNull;
 import static androidx.media3.container.MdtaMetadataEntry.AUXILIARY_TRACKS_SAMPLES_NOT_INTERLEAVED;
 import static androidx.media3.extractor.mp4.BoxParser.parseTraks;
@@ -35,6 +36,7 @@ import static java.lang.annotation.ElementType.TYPE_USE;
 
 import androidx.annotation.IntDef;
 import androidx.annotation.Nullable;
+import androidx.annotation.VisibleForTesting;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.Metadata;
@@ -224,6 +226,53 @@ public final class Mp4Extractor implements Extractor, SeekMap {
    */
   private static final long MAXIMUM_READ_AHEAD_BYTES_STREAM = 10 * 1024 * 1024;
 
+  /**
+   * Largest presentation-time lead, in microseconds, for which a catch-up reload is still allowed.
+   *
+   * <p>Accumulated sample size is a poor proxy for time on sparse tracks such as subtitles: a
+   * single cue can be tens of bytes and still be minutes ahead. Reloading the source for that cue
+   * seeks hundreds of megabytes (or more) forward and back, which underruns the playback buffer.
+   */
+  private static final long MAXIMUM_CATCH_UP_AHEAD_TIME_US = 5L * C.MICROS_PER_SECOND;
+
+  /**
+   * Samples of a text track that lie within this many bytes of each other are read in one visit.
+   *
+   * <p>A subtitle cue is sometimes muxed far from the audio and video at the same presentation
+   * time, with the following cues packed beside it. Seeking to each cue reloads the source.
+   * Entering that run at its earliest sample, then reading every following text sample that does
+   * not itself require a reload, turns the whole run into one round trip.
+   */
+  private static final long TEXT_SAMPLE_RUN_BYTES = 1024 * 1024;
+
+  /**
+   * Text samples farther than this from the interleaved audio or video at the same presentation
+   * time are read once, before playback samples, and then served from memory.
+   */
+  private static final long OUT_OF_BAND_TEXT_DISTANCE_BYTES = 2L * 1024 * 1024;
+
+  /** Largest single text sample, and largest total, kept by {@link #prepareOutOfBandTextPrefetch}. */
+  private static final int MAX_PREFETCHED_TEXT_SAMPLE_BYTES = 1024 * 1024;
+
+  private static final int MAX_PREFETCHED_TEXT_BYTES = 4 * 1024 * 1024;
+
+  /**
+   * Largest number of range requests used to read out-of-band text before the first playback
+   * sample.
+   *
+   * <p>Cues packed into a few clusters (for example at the end of a large file) stay under this
+   * limit. Cues scattered through the media, one sample per cluster, do not: hundreds of seeks
+   * before the first frame keep the player from opening, so those samples are left to the normal
+   * read order.
+   */
+  private static final int MAX_OUT_OF_BAND_TEXT_RUNS = 32;
+
+  /**
+   * A tx3g sample of this size is only the text-length field. The length is zero, so the cue has no
+   * text. Reloading the source for it does not produce a subtitle.
+   */
+  private static final int EMPTY_TX3G_SAMPLE_BYTES = 2;
+
   private final SubtitleParser.Factory subtitleParserFactory;
   private final @Flags int flags;
 
@@ -256,6 +305,16 @@ public final class Mp4Extractor implements Extractor, SeekMap {
 
   // Used when auxiliary tracks samples are in the auxiliary tracks MP4 (inside axte atom).
   private long sampleOffsetForAuxiliaryTracks;
+
+  /**
+   * Bytes of text samples that sit far from the audio and video at the same timestamp. Indexed
+   * {@code [trackIndex][sampleIndex]}. A null row means the track has nothing prefetched.
+   */
+  @Nullable private byte[][][] prefetchedTextSamples;
+
+  @Nullable private List<OutOfBandTextSample> textPrefetchSamples;
+  private int textPrefetchReadIndex;
+  private boolean textPrefetchComplete;
 
   // Extractor outputs.
   private ExtractorOutput extractorOutput;
@@ -311,6 +370,7 @@ public final class Mp4Extractor implements Extractor, SeekMap {
     slowMotionMetadataEntries = new ArrayList<>();
     atomHeader = new ParsableByteArray(Mp4Box.LONG_HEADER_SIZE);
     containerAtoms = new ArrayDeque<>();
+    textPrefetchComplete = true;
     nalStartCode = new ParsableByteArray(NalUnitUtil.NAL_START_CODE);
     nalPrefix = new ParsableByteArray(6);
     scratch = new ParsableByteArray();
@@ -369,6 +429,7 @@ public final class Mp4Extractor implements Extractor, SeekMap {
     sampleCurrentNalBytesRemaining = 0;
     isSampleDependedOn = false;
     if (position == 0) {
+      clearOutOfBandTextPrefetch();
       // Reading the SEF data occurs before normal MP4 parsing. Therefore we can not transition to
       // reading the atom header until that has completed.
       if (parserState != STATE_READING_SEF) {
@@ -377,7 +438,12 @@ public final class Mp4Extractor implements Extractor, SeekMap {
         sefReader.reset();
         slowMotionMetadataEntries.clear();
       }
-    } else {
+    } else if (!textPrefetchComplete) {
+      // A seek before the upfront text read finishes drops the partial cache. Playback then reads
+      // text with the samples instead of resuming a stale prefetch.
+      clearOutOfBandTextPrefetch();
+    }
+    if (position != 0) {
       for (Mp4Track track : tracks) {
         updateSampleIndex(track, timeUs);
         if (track.trueHdSampleRechunker != null) {
@@ -785,6 +851,7 @@ public final class Mp4Extractor implements Extractor, SeekMap {
     this.durationUs = durationUs;
     this.tracks = tracks.toArray(new Mp4Track[0]);
     accumulatedSampleSizes = calculateAccumulatedSampleSizes(this.tracks);
+    prepareOutOfBandTextPrefetch();
 
     extractorOutput.endTracks();
     extractorOutput.seekMap(this);
@@ -873,6 +940,9 @@ public final class Mp4Extractor implements Extractor, SeekMap {
   private int readSample(ExtractorInput input, PositionHolder positionHolder) throws IOException {
     long inputPosition = input.getPosition();
     if (sampleTrackIndex == C.INDEX_UNSET) {
+      if (!textPrefetchComplete) {
+        return readOutOfBandTextPrefetch(input, positionHolder);
+      }
       sampleTrackIndex = getTrackIndexOfNextReadSample(inputPosition);
       if (sampleTrackIndex == C.INDEX_UNSET) {
         return RESULT_END_OF_INPUT;
@@ -881,6 +951,10 @@ public final class Mp4Extractor implements Extractor, SeekMap {
     Mp4Track track = tracks[sampleTrackIndex];
     TrackOutput trackOutput = track.trackOutput;
     int sampleIndex = track.sampleIndex;
+    byte[] prefetchedText = peekPrefetchedTextSample(sampleTrackIndex, sampleIndex);
+    if (prefetchedText != null) {
+      return outputPrefetchedTextSample(track, sampleIndex, prefetchedText);
+    }
     long position = track.sampleTable.offsets[sampleIndex] + sampleOffsetForAuxiliaryTracks;
     int sampleSize = track.sampleTable.sizes[sampleIndex];
     @Nullable TrueHdSampleRechunker trueHdSampleRechunker = track.trueHdSampleRechunker;
@@ -1020,7 +1094,13 @@ public final class Mp4Extractor implements Extractor, SeekMap {
    * <p>To deal with poor sample interleaving, we also check whether the required memory to catch up
    * with the next logical sample (based on sample time) exceeds {@link
    * #MAXIMUM_READ_AHEAD_BYTES_STREAM}. If this is the case, we continue with this sample even
-   * though it may require a source reload.
+   * though it may require a source reload. A catch-up sample that is more than {@link
+   * #MAXIMUM_CATCH_UP_AHEAD_TIME_US} ahead of the preferred sample is left until the read cursor
+   * reaches it, so a sparse subtitle cue cannot pull the loader away from the audio and video
+   * samples that are actually due. A text sample that is already within {@link
+   * #RELOAD_MINIMUM_SEEK_DISTANCE} stays selected until that run ends, and a long seek to a text
+   * sample starts at the earliest text sample within {@link #TEXT_SAMPLE_RUN_BYTES} before it. An
+   * empty tx3g sample that would require a reload is skipped: it has no cue text.
    */
   private int getTrackIndexOfNextReadSample(long inputPosition) {
     long preferredSkipAmount = Long.MAX_VALUE;
@@ -1032,11 +1112,15 @@ public final class Mp4Extractor implements Extractor, SeekMap {
     int minAccumulatedBytesTrackIndex = C.INDEX_UNSET;
     for (int trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
       Mp4Track track = tracks[trackIndex];
-      int sampleIndex = track.sampleIndex;
+      int sampleIndex = skipEmptyOutOfBandTx3gSamples(track, trackIndex, inputPosition);
       if (sampleIndex == track.sampleTable.sampleCount) {
         continue;
       }
       long sampleOffset = track.sampleTable.offsets[sampleIndex];
+      if (hasPrefetchedTextSample(trackIndex, sampleIndex)) {
+        // Bytes are already in memory. Keep the read cursor on the audio and video.
+        sampleOffset = inputPosition;
+      }
       long sampleAccumulatedBytes = castNonNull(accumulatedSampleSizes)[trackIndex][sampleIndex];
       long skipAmount = sampleOffset - inputPosition;
       boolean requiresReload = skipAmount < 0 || skipAmount >= RELOAD_MINIMUM_SEEK_DISTANCE;
@@ -1053,11 +1137,349 @@ public final class Mp4Extractor implements Extractor, SeekMap {
         minAccumulatedBytesTrackIndex = trackIndex;
       }
     }
-    return minAccumulatedBytes == Long.MAX_VALUE
-            || !minAccumulatedBytesRequiresReload
-            || preferredAccumulatedBytes < minAccumulatedBytes + MAXIMUM_READ_AHEAD_BYTES_STREAM
-        ? preferredTrackIndex
-        : minAccumulatedBytesTrackIndex;
+    boolean catchUpSampleIsAheadInTime = false;
+    if (preferredTrackIndex != C.INDEX_UNSET
+        && minAccumulatedBytesTrackIndex != C.INDEX_UNSET
+        && preferredTrackIndex != minAccumulatedBytesTrackIndex) {
+      Mp4Track preferredTrack = tracks[preferredTrackIndex];
+      Mp4Track catchUpTrack = tracks[minAccumulatedBytesTrackIndex];
+      long preferredTimeUs = preferredTrack.sampleTable.timestampsUs[preferredTrack.sampleIndex];
+      long catchUpTimeUs = catchUpTrack.sampleTable.timestampsUs[catchUpTrack.sampleIndex];
+      catchUpSampleIsAheadInTime = catchUpTimeUs > preferredTimeUs + MAXIMUM_CATCH_UP_AHEAD_TIME_US;
+    }
+    if (preferredTrackIndex != C.INDEX_UNSET
+        && !preferredRequiresReload
+        && tracks[preferredTrackIndex].track.type == C.TRACK_TYPE_TEXT) {
+      // The cursor is already on a text run. Keep reading it instead of reloading audio or video
+      // that sits elsewhere in the file.
+      return preferredTrackIndex;
+    }
+    int chosenTrackIndex =
+        minAccumulatedBytes == Long.MAX_VALUE
+                || !minAccumulatedBytesRequiresReload
+                || preferredAccumulatedBytes < minAccumulatedBytes + MAXIMUM_READ_AHEAD_BYTES_STREAM
+                || catchUpSampleIsAheadInTime
+            ? preferredTrackIndex
+            : minAccumulatedBytesTrackIndex;
+    return maybeStartTextSampleRunAtEarliestSample(chosenTrackIndex, inputPosition);
+  }
+
+  /**
+   * Advances past empty tx3g samples that sit far from {@code inputPosition}. A sample the cursor
+   * can already read, or one served from the prefetch cache, stays selected.
+   */
+  private int skipEmptyOutOfBandTx3gSamples(Mp4Track track, int trackIndex, long inputPosition) {
+    int sampleIndex = track.sampleIndex;
+    if (!MimeTypes.APPLICATION_TX3G.equals(track.track.format.sampleMimeType)) {
+      return sampleIndex;
+    }
+    TrackSampleTable sampleTable = track.sampleTable;
+    while (sampleIndex < sampleTable.sampleCount
+        && sampleTable.sizes[sampleIndex] <= EMPTY_TX3G_SAMPLE_BYTES
+        && !hasPrefetchedTextSample(trackIndex, sampleIndex)) {
+      long skipAmount = sampleTable.offsets[sampleIndex] - inputPosition;
+      if (skipAmount >= 0 && skipAmount < RELOAD_MINIMUM_SEEK_DISTANCE) {
+        break;
+      }
+      sampleIndex++;
+    }
+    track.sampleIndex = sampleIndex;
+    return sampleIndex;
+  }
+
+  /**
+   * If {@code chosenTrackIndex} is a text sample far from {@code inputPosition}, returns the text
+   * track whose next sample is earliest within {@link #TEXT_SAMPLE_RUN_BYTES} before that sample.
+   */
+  private int maybeStartTextSampleRunAtEarliestSample(int chosenTrackIndex, long inputPosition) {
+    if (chosenTrackIndex == C.INDEX_UNSET
+        || tracks[chosenTrackIndex].track.type != C.TRACK_TYPE_TEXT) {
+      return chosenTrackIndex;
+    }
+    Mp4Track chosenTrack = tracks[chosenTrackIndex];
+    long chosenOffset = chosenTrack.sampleTable.offsets[chosenTrack.sampleIndex];
+    long chosenSkip = chosenOffset - inputPosition;
+    if (chosenSkip <= TEXT_SAMPLE_RUN_BYTES && chosenSkip >= -TEXT_SAMPLE_RUN_BYTES) {
+      return chosenTrackIndex;
+    }
+    int earliestTrackIndex = chosenTrackIndex;
+    long earliestOffset = chosenOffset;
+    for (int trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+      Mp4Track track = tracks[trackIndex];
+      if (track.track.type != C.TRACK_TYPE_TEXT) {
+        continue;
+      }
+      int sampleIndex = track.sampleIndex;
+      if (sampleIndex == track.sampleTable.sampleCount) {
+        continue;
+      }
+      long sampleOffset = track.sampleTable.offsets[sampleIndex];
+      if (sampleOffset < earliestOffset && chosenOffset - sampleOffset <= TEXT_SAMPLE_RUN_BYTES) {
+        earliestOffset = sampleOffset;
+        earliestTrackIndex = trackIndex;
+      }
+    }
+    return earliestTrackIndex;
+  }
+
+  /**
+   * Selects and consumes the next sample the way {@link #readSample} would, without reading sample
+   * bytes.
+   *
+   * <p>A prefetched text sample does not move the read cursor: both returned values stay at {@code
+   * inputPosition} and {@code 0}.
+   *
+   * @param inputPosition Current extractor input position.
+   * @param offsetAndSize Receives the sample file offset at index 0 and the sample size at index 1.
+   * @return {@code false} if no sample remains.
+   */
+  @VisibleForTesting
+  boolean consumeNextSampleForTests(long inputPosition, long[] offsetAndSize) {
+    int trackIndex = getTrackIndexOfNextReadSample(inputPosition);
+    if (trackIndex == C.INDEX_UNSET) {
+      return false;
+    }
+    Mp4Track track = tracks[trackIndex];
+    int sampleIndex = track.sampleIndex++;
+    if (hasPrefetchedTextSample(trackIndex, sampleIndex)) {
+      offsetAndSize[0] = inputPosition;
+      offsetAndSize[1] = 0;
+    } else {
+      offsetAndSize[0] = track.sampleTable.offsets[sampleIndex];
+      offsetAndSize[1] = track.sampleTable.sizes[sampleIndex];
+    }
+    return true;
+  }
+
+  /** Whether text samples that sit far from the picture still have to be read from the source. */
+  @VisibleForTesting
+  boolean isOutOfBandTextPrefetchPending() {
+    return !textPrefetchComplete;
+  }
+
+  /** Number of text samples scheduled for the upfront read, including ones already cached. */
+  @VisibleForTesting
+  int outOfBandTextSampleCountForTests() {
+    return textPrefetchSamples == null ? 0 : textPrefetchSamples.size();
+  }
+
+  /**
+   * Collects text samples that are far from the audio or video at the same timestamp. They are read
+   * in a few range requests before the first playback sample, so a cue at the end of a large file
+   * cannot pull the loader away from the picture. Scattered cues that would need more than {@link
+   * #MAX_OUT_OF_BAND_TEXT_RUNS} requests are not prefetched.
+   */
+  private void prepareOutOfBandTextPrefetch() {
+    clearOutOfBandTextPrefetch();
+    int referenceTrackIndex = findInterleavedReferenceTrackIndex();
+    if (referenceTrackIndex == C.INDEX_UNSET) {
+      return;
+    }
+    TrackSampleTable referenceTable = tracks[referenceTrackIndex].sampleTable;
+    List<OutOfBandTextSample> samples = new ArrayList<>();
+    byte[][][] prefetched = new byte[tracks.length][][];
+    long totalBytes = 0;
+    boolean budgetExhausted = false;
+    for (int trackIndex = 0; trackIndex < tracks.length && !budgetExhausted; trackIndex++) {
+      Mp4Track track = tracks[trackIndex];
+      if (track.track.type != C.TRACK_TYPE_TEXT) {
+        continue;
+      }
+      TrackSampleTable sampleTable = track.sampleTable;
+      for (int sampleIndex = 0; sampleIndex < sampleTable.sampleCount; sampleIndex++) {
+        int sampleSize = sampleTable.sizes[sampleIndex];
+        if (sampleSize < 0 || sampleSize > MAX_PREFETCHED_TEXT_SAMPLE_BYTES) {
+          continue;
+        }
+        long sampleOffset = sampleTable.offsets[sampleIndex] + sampleOffsetForAuxiliaryTracks;
+        long referenceOffset =
+            sampleOffsetAtTimeUs(referenceTable, sampleTable.timestampsUs[sampleIndex])
+                + sampleOffsetForAuxiliaryTracks;
+        long delta = sampleOffset - referenceOffset;
+        if (delta <= OUT_OF_BAND_TEXT_DISTANCE_BYTES
+            && delta >= -OUT_OF_BAND_TEXT_DISTANCE_BYTES) {
+          continue;
+        }
+        if (totalBytes + sampleSize > MAX_PREFETCHED_TEXT_BYTES) {
+          budgetExhausted = true;
+          break;
+        }
+        if (prefetched[trackIndex] == null) {
+          prefetched[trackIndex] = new byte[sampleTable.sampleCount][];
+        }
+        samples.add(new OutOfBandTextSample(trackIndex, sampleIndex, sampleOffset, sampleSize));
+        totalBytes += sampleSize;
+      }
+    }
+    if (samples.isEmpty() || countOutOfBandTextRuns(samples) > MAX_OUT_OF_BAND_TEXT_RUNS) {
+      return;
+    }
+    orderOutOfBandTextSamples(samples);
+    prefetchedTextSamples = prefetched;
+    textPrefetchSamples = samples;
+    textPrefetchReadIndex = 0;
+    textPrefetchComplete = false;
+  }
+
+  /**
+   * Number of source reloads required to read {@code samples}. A gap of at least {@link
+   * #RELOAD_MINIMUM_SEEK_DISTANCE} starts a new run.
+   */
+  private static int countOutOfBandTextRuns(List<OutOfBandTextSample> samples) {
+    if (samples.size() <= 1) {
+      return samples.size();
+    }
+    samples.sort((first, second) -> Long.compare(first.offset, second.offset));
+    int runs = 1;
+    for (int index = 1; index < samples.size(); index++) {
+      OutOfBandTextSample previous = samples.get(index - 1);
+      OutOfBandTextSample current = samples.get(index);
+      long gap = current.offset - (previous.offset + previous.size);
+      if (gap >= RELOAD_MINIMUM_SEEK_DISTANCE) {
+        runs++;
+      }
+    }
+    return runs;
+  }
+
+  /**
+   * Orders samples so each contiguous run is read forward, and runs are visited from the end of the
+   * file toward the start. After {@code moov} the cursor is already at the end.
+   */
+  private static void orderOutOfBandTextSamples(List<OutOfBandTextSample> samples) {
+    samples.sort((first, second) -> Long.compare(first.offset, second.offset));
+    List<OutOfBandTextSample> ordered = new ArrayList<>(samples.size());
+    for (int runEnd = samples.size() - 1; runEnd >= 0; ) {
+      int runStart = runEnd;
+      while (runStart > 0) {
+        OutOfBandTextSample previous = samples.get(runStart - 1);
+        OutOfBandTextSample current = samples.get(runStart);
+        long gap = current.offset - (previous.offset + previous.size);
+        if (gap >= RELOAD_MINIMUM_SEEK_DISTANCE) {
+          break;
+        }
+        runStart--;
+      }
+      for (int index = runStart; index <= runEnd; index++) {
+        ordered.add(samples.get(index));
+      }
+      runEnd = runStart - 1;
+    }
+    samples.clear();
+    samples.addAll(ordered);
+  }
+
+  private int readOutOfBandTextPrefetch(ExtractorInput input, PositionHolder positionHolder)
+      throws IOException {
+    List<OutOfBandTextSample> samples = checkNotNull(textPrefetchSamples);
+    byte[][][] prefetched = checkNotNull(prefetchedTextSamples);
+    while (textPrefetchReadIndex < samples.size()) {
+      OutOfBandTextSample sample = samples.get(textPrefetchReadIndex);
+      long skipAmount = sample.offset - input.getPosition();
+      if (skipAmount < 0 || skipAmount >= RELOAD_MINIMUM_SEEK_DISTANCE) {
+        positionHolder.position = sample.offset;
+        return RESULT_SEEK;
+      }
+      if (skipAmount > 0) {
+        input.skipFully((int) skipAmount);
+      }
+      byte[] data = new byte[sample.size];
+      if (sample.size > 0) {
+        input.readFully(data, /* offset= */ 0, sample.size);
+      }
+      prefetched[sample.trackIndex][sample.sampleIndex] = data;
+      textPrefetchReadIndex++;
+    }
+    textPrefetchComplete = true;
+    return RESULT_CONTINUE;
+  }
+
+  private int outputPrefetchedTextSample(Mp4Track track, int sampleIndex, byte[] data) {
+    int sampleSize = data.length;
+    ParsableByteArray sampleData = new ParsableByteArray(data);
+    if (track.track.sampleTransformation == Track.TRANSFORMATION_CEA608_CDAT
+        && data.length >= Mp4Box.HEADER_SIZE) {
+      sampleData.setPosition(Mp4Box.HEADER_SIZE);
+      sampleSize -= Mp4Box.HEADER_SIZE;
+    }
+    if (sampleSize > 0) {
+      track.trackOutput.sampleData(sampleData, sampleSize);
+    }
+    if (!canReadWithinGopSampleDependencies(track.track.format)) {
+      isSampleDependedOn = true;
+    }
+    long timeUs = track.sampleTable.timestampsUs[sampleIndex];
+    @C.BufferFlags int sampleFlags = track.sampleTable.flags[sampleIndex];
+    if (!isSampleDependedOn) {
+      sampleFlags |= C.BUFFER_FLAG_NOT_DEPENDED_ON;
+    }
+    track.trackOutput.sampleMetadata(
+        timeUs, sampleFlags, sampleSize, /* offset= */ 0, /* cryptoData= */ null);
+    track.sampleIndex++;
+    sampleTrackIndex = C.INDEX_UNSET;
+    sampleBytesRead = 0;
+    sampleBytesWritten = 0;
+    sampleCurrentNalBytesRemaining = 0;
+    isSampleDependedOn = false;
+    return RESULT_CONTINUE;
+  }
+
+  private void clearOutOfBandTextPrefetch() {
+    prefetchedTextSamples = null;
+    textPrefetchSamples = null;
+    textPrefetchReadIndex = 0;
+    textPrefetchComplete = true;
+  }
+
+  private int findInterleavedReferenceTrackIndex() {
+    if (firstVideoTrackIndex != C.INDEX_UNSET
+        && tracks[firstVideoTrackIndex].sampleTable.sampleCount > 0) {
+      return firstVideoTrackIndex;
+    }
+    for (int trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+      Mp4Track track = tracks[trackIndex];
+      if (track.track.type == C.TRACK_TYPE_AUDIO && track.sampleTable.sampleCount > 0) {
+        return trackIndex;
+      }
+    }
+    return C.INDEX_UNSET;
+  }
+
+  private static long sampleOffsetAtTimeUs(TrackSampleTable sampleTable, long timeUs) {
+    int sampleIndex =
+        binarySearchFloor(
+            sampleTable.timestampsUs, timeUs, /* inclusive= */ true, /* stayInBounds= */ true);
+    return sampleTable.offsets[sampleIndex];
+  }
+
+  @Nullable
+  private byte[] peekPrefetchedTextSample(int trackIndex, int sampleIndex) {
+    if (!hasPrefetchedTextSample(trackIndex, sampleIndex)) {
+      return null;
+    }
+    return checkNotNull(prefetchedTextSamples)[trackIndex][sampleIndex];
+  }
+
+  private boolean hasPrefetchedTextSample(int trackIndex, int sampleIndex) {
+    if (prefetchedTextSamples == null) {
+      return false;
+    }
+    byte[][] trackSamples = prefetchedTextSamples[trackIndex];
+    return trackSamples != null && trackSamples[sampleIndex] != null;
+  }
+
+  private static final class OutOfBandTextSample {
+    public final int trackIndex;
+    public final int sampleIndex;
+    public final long offset;
+    public final int size;
+
+    public OutOfBandTextSample(int trackIndex, int sampleIndex, long offset, int size) {
+      this.trackIndex = trackIndex;
+      this.sampleIndex = sampleIndex;
+      this.offset = offset;
+      this.size = size;
+    }
   }
 
   /** Updates a track's sample index to point its latest sync sample before/at {@code timeUs}. */
