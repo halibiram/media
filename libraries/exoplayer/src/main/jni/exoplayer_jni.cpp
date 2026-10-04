@@ -1,6 +1,4 @@
 #include <jni.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -11,22 +9,21 @@ namespace {
 jclass gAllocationClass = nullptr;
 jmethodID gAllocationConstructor = nullptr;
 
-// NewDirectByteBuffer does not require page alignment. A 64-byte (cache line /
-// SIMD friendly) alignment keeps the off-heap fast paths fast while avoiding the
-// large per-allocation internal fragmentation that full page alignment caused on
-// 16 KB-page and low-RAM devices.
-constexpr size_t kBufferAlignment = 64;
-
 void *allocateZeroedMemory(jint size) {
-  void *memory = nullptr;
   if (size <= 0) {
     return nullptr;
   }
-  if (posix_memalign(&memory, kBufferAlignment, static_cast<size_t>(size)) != 0) {
-    return nullptr;
-  }
-  std::memset(memory, 0, static_cast<size_t>(size));
-  return memory;
+  // Use calloc instead of posix_memalign. Scudo (the Android allocator) only
+  // guarantees 16-byte alignment on its Primary allocator and routes every
+  // request with a larger alignment to the Secondary allocator, which performs
+  // one mmap (+ guard page) per allocation. Since each 64 KB sample chunk was
+  // allocated with posix_memalign(64, ...), a large buffer target produced tens
+  // of thousands of tiny mappings, exhausted vm.max_map_count (65535) and Scudo
+  // aborted the process with SIGABRT ("internal map failure (Out of memory)").
+  // calloc stays on Scudo Primary size-class regions (shared mappings), and
+  // its 16-byte alignment is sufficient for NewDirectByteBuffer and the
+  // memcpy/NEON based sample pipeline.
+  return std::calloc(1, static_cast<size_t>(size));
 }
 
 // 1. DefaultAllocatorNative methods
