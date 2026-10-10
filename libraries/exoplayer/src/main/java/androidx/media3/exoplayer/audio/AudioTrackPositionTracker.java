@@ -287,7 +287,7 @@ import java.lang.reflect.Method;
     resetSyncParams();
   }
 
-  public long getCurrentPositionUs() {
+  public long getCurrentPositionUs(long writtenFrames) {
     AudioTrack audioTrack = checkNotNull(this.audioTrack);
     if (audioTrack.getPlayState() == PLAYSTATE_PLAYING) {
       maybeSampleSyncParams();
@@ -302,6 +302,14 @@ import java.lang.reflect.Method;
         useGetTimestampMode
             ? audioTimestampPoller.getTimestampPositionUs(systemTimeUs, audioTrackPlaybackSpeed)
             : getPlaybackHeadPositionEstimateUs(systemTimeUs);
+
+    long maxPositionUs = sampleCountToDurationUs(writtenFrames, outputSampleRate);
+    if (positionUs >= maxPositionUs) {
+      positionUs = maxPositionUs;
+      resetSyncParams();
+      audioTimestampPoller.reset();
+      return positionUs;
+    }
 
     int audioTrackPlayState = audioTrack.getPlayState();
     if (audioTrackPlayState == PLAYSTATE_PLAYING) {
@@ -441,7 +449,8 @@ import java.lang.reflect.Method;
    * @return Whether the audio track has any pending data to play out.
    */
   public boolean hasPendingData(long writtenFrames) {
-    return writtenFrames > durationUsToSampleCount(getCurrentPositionUs(), outputSampleRate)
+    return writtenFrames
+            > durationUsToSampleCount(getCurrentPositionUs(writtenFrames), outputSampleRate)
         || forceHasPendingData();
   }
 
