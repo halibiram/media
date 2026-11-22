@@ -44,16 +44,32 @@ import java.io.IOException;
       long inputLength,
       int pcrPid,
       int timestampSearchBytes) {
+    this(
+        pcrTimestampAdjuster,
+        streamDurationUs,
+        inputLength,
+        pcrPid,
+        timestampSearchBytes,
+        TsExtractor.TS_PACKET_SIZE);
+  }
+
+  public TsBinarySearchSeeker(
+      TimestampAdjuster pcrTimestampAdjuster,
+      long streamDurationUs,
+      long inputLength,
+      int pcrPid,
+      int timestampSearchBytes,
+      int packetSize) {
     super(
         new DefaultSeekTimestampConverter(),
-        new TsPcrSeeker(pcrPid, pcrTimestampAdjuster, timestampSearchBytes),
+        new TsPcrSeeker(pcrPid, pcrTimestampAdjuster, timestampSearchBytes, packetSize),
         streamDurationUs,
         /* floorTimePosition= */ 0,
         /* ceilingTimePosition= */ streamDurationUs + 1,
         /* floorBytePosition= */ 0,
         /* ceilingBytePosition= */ inputLength,
-        /* approxBytesPerFrame= */ TsExtractor.TS_PACKET_SIZE,
-        MINIMUM_SEARCH_RANGE_BYTES);
+        /* approxBytesPerFrame= */ packetSize,
+        5 * packetSize);
   }
 
   /**
@@ -71,12 +87,17 @@ import java.io.IOException;
     private final ParsableByteArray packetBuffer;
     private final int pcrPid;
     private final int timestampSearchBytes;
+    private final int packetSize;
 
     public TsPcrSeeker(
-        int pcrPid, TimestampAdjuster pcrTimestampAdjuster, int timestampSearchBytes) {
+        int pcrPid,
+        TimestampAdjuster pcrTimestampAdjuster,
+        int timestampSearchBytes,
+        int packetSize) {
       this.pcrPid = pcrPid;
       this.pcrTimestampAdjuster = pcrTimestampAdjuster;
       this.timestampSearchBytes = timestampSearchBytes;
+      this.packetSize = packetSize;
       packetBuffer = new ParsableByteArray();
     }
 
@@ -102,7 +123,8 @@ import java.io.IOException;
 
       while (packetBuffer.bytesLeft() >= TsExtractor.TS_PACKET_SIZE) {
         int startOfPacket =
-            TsUtil.findSyncBytePosition(packetBuffer.getData(), packetBuffer.getPosition(), limit);
+            TsUtil.findSyncBytePosition(
+                packetBuffer.getData(), packetBuffer.getPosition(), limit, packetSize);
         int endOfPacket = startOfPacket + TsExtractor.TS_PACKET_SIZE;
         if (endOfPacket > limit) {
           break;
@@ -127,8 +149,9 @@ import java.io.IOException;
           lastPcrTimeUsInRange = pcrTimeUs;
           startOfLastPacketPosition = startOfPacket;
         }
-        packetBuffer.setPosition(endOfPacket);
-        endOfLastPacketPosition = endOfPacket;
+        int nextPacketStart = min(startOfPacket + packetSize, limit);
+        packetBuffer.setPosition(nextPacketStart);
+        endOfLastPacketPosition = nextPacketStart;
       }
 
       if (lastPcrTimeUsInRange != C.TIME_UNSET) {

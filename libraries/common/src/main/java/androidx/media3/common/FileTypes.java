@@ -167,6 +167,8 @@ public final class FileTypes {
   private static final String EXTENSION_M2P = ".m2p";
   private static final String EXTENSION_TS = ".ts";
   private static final String EXTENSION_PREFIX_TS = ".ts";
+  private static final String EXTENSION_M2TS = ".m2ts";
+  private static final String EXTENSION_MTS = ".mts";
   private static final String EXTENSION_WAV = ".wav";
   private static final String EXTENSION_WAVE = ".wave";
   private static final String EXTENSION_VTT = ".vtt";
@@ -312,6 +314,8 @@ public final class FileTypes {
         || filename.endsWith(EXTENSION_M2P)) {
       return FileTypes.PS;
     } else if (filename.endsWith(EXTENSION_TS)
+        || filename.endsWith(EXTENSION_M2TS)
+        || filename.endsWith(EXTENSION_MTS)
         || filename.startsWith(
             EXTENSION_PREFIX_TS,
             /* toffset= */ filename.length() - (EXTENSION_PREFIX_TS.length() + 1))) {

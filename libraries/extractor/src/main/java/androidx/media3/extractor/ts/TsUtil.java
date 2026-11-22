@@ -41,9 +41,18 @@ public final class TsUtil {
    * @return Whether a TS packet starts at {@code searchPosition}.
    */
   public static boolean isStartOfTsPacket(byte[] data, int start, int limit, int searchPosition) {
+    return isStartOfTsPacket(data, start, limit, searchPosition, TsExtractor.TS_PACKET_SIZE);
+  }
+
+  /**
+   * Returns whether a transport stream packet of size {@code packetSize} starts at {@code
+   * searchPosition} by verifying five consecutive sync bytes separated by {@code packetSize}.
+   */
+  public static boolean isStartOfTsPacket(
+      byte[] data, int start, int limit, int searchPosition, int packetSize) {
     int consecutiveSyncByteCount = 0;
     for (int i = -4; i <= 4; i++) {
-      int currentPosition = searchPosition + i * TsExtractor.TS_PACKET_SIZE;
+      int currentPosition = searchPosition + i * packetSize;
       if (currentPosition < start
           || currentPosition >= limit
           || data[currentPosition] != TsExtractor.TS_SYNC_BYTE) {
@@ -65,6 +74,32 @@ public final class TsUtil {
       position++;
     }
     return position;
+  }
+
+  /**
+   * Returns the position of the first valid TS_SYNC_BYTE for packets spaced by {@code packetSize}
+   * within {@code [startPosition, limitPosition)}, or {@code limitPosition} if none could be found.
+   *
+   * <p>For 192-byte BDAV M2TS streams, verifies that a matching sync byte also appears {@code
+   * packetSize} bytes ahead (when enough bytes are available) so stray {@code 0x47} bytes inside
+   * 4-byte arrival-timestamp headers are not mistaken for packet starts.
+   */
+  public static int findSyncBytePosition(
+      byte[] data, int startPosition, int limitPosition, int packetSize) {
+    if (packetSize == TsExtractor.TS_PACKET_SIZE || limitPosition - startPosition <= packetSize) {
+      return findSyncBytePosition(data, startPosition, limitPosition);
+    }
+    int position = startPosition;
+    while (position + packetSize < limitPosition) {
+      if (data[position] == TsExtractor.TS_SYNC_BYTE
+          && data[position + packetSize] == TsExtractor.TS_SYNC_BYTE
+          && (position + 2 * packetSize >= limitPosition
+              || data[position + 2 * packetSize] == TsExtractor.TS_SYNC_BYTE)) {
+        return position;
+      }
+      position++;
+    }
+    return limitPosition;
   }
 
   /**

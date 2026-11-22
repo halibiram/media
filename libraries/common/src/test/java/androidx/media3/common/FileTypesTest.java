@@ -86,6 +86,14 @@ public class FileTypesTest {
   }
 
   @Test
+  public void inferFileFormat_fromM2tsAndMtsUris_returnsTs() {
+    assertThat(inferFileTypeFromUri(Uri.parse("http://example.com/BDMV/STREAM/00001.m2ts")))
+        .isEqualTo(FileTypes.TS);
+    assertThat(inferFileTypeFromUri(Uri.parse("http://example.com/clip.mts?token=123")))
+        .isEqualTo(FileTypes.TS);
+  }
+
+  @Test
   public void inferFileFormat_fromUriWithUnknownExtension_returnsUnknownFormat() {
     assertThat(inferFileTypeFromUri(Uri.parse("filename.unknown"))).isEqualTo(FileTypes.UNKNOWN);
   }

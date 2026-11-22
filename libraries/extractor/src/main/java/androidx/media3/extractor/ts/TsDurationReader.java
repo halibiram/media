@@ -81,17 +81,28 @@ import java.io.IOException;
    */
   public @Extractor.ReadResult int readDuration(
       ExtractorInput input, PositionHolder seekPositionHolder, int pcrPid) throws IOException {
+    return readDuration(
+        input, seekPositionHolder, pcrPid, TsExtractor.TS_PACKET_SIZE, timestampSearchBytes);
+  }
+
+  public @Extractor.ReadResult int readDuration(
+      ExtractorInput input,
+      PositionHolder seekPositionHolder,
+      int pcrPid,
+      int packetSize,
+      int searchBytes)
+      throws IOException {
     if (pcrPid <= 0) {
       return finishReadDuration(input);
     }
     if (!isLastPcrValueRead) {
-      return readLastPcrValue(input, seekPositionHolder, pcrPid);
+      return readLastPcrValue(input, seekPositionHolder, pcrPid, packetSize, searchBytes);
     }
     if (lastPcrValue == C.TIME_UNSET) {
       return finishReadDuration(input);
     }
     if (!isFirstPcrValueRead) {
-      return readFirstPcrValue(input, seekPositionHolder, pcrPid);
+      return readFirstPcrValue(input, seekPositionHolder, pcrPid, packetSize, searchBytes);
     }
     if (firstPcrValue == C.TIME_UNSET) {
       return finishReadDuration(input);
@@ -126,9 +137,14 @@ import java.io.IOException;
     return Extractor.RESULT_CONTINUE;
   }
 
-  private int readFirstPcrValue(ExtractorInput input, PositionHolder seekPositionHolder, int pcrPid)
+  private int readFirstPcrValue(
+      ExtractorInput input,
+      PositionHolder seekPositionHolder,
+      int pcrPid,
+      int packetSize,
+      int searchBytes)
       throws IOException {
-    int bytesToSearch = (int) min(timestampSearchBytes, input.getLength());
+    int bytesToSearch = (int) min(searchBytes, input.getLength());
     int searchStartPosition = 0;
     if (input.getPosition() != searchStartPosition) {
       seekPositionHolder.position = searchStartPosition;
@@ -139,14 +155,34 @@ import java.io.IOException;
     input.resetPeekPosition();
     input.peekFully(packetBuffer.getData(), /* offset= */ 0, bytesToSearch);
 
-    firstPcrValue = readFirstPcrValueFromBuffer(packetBuffer, pcrPid);
+    firstPcrValue = readFirstPcrValueFromBuffer(packetBuffer, pcrPid, packetSize);
     isFirstPcrValueRead = true;
     return Extractor.RESULT_CONTINUE;
   }
 
-  private long readFirstPcrValueFromBuffer(ParsableByteArray packetBuffer, int pcrPid) {
+  private long readFirstPcrValueFromBuffer(
+      ParsableByteArray packetBuffer, int pcrPid, int packetSize) {
     int searchStartPosition = packetBuffer.getPosition();
     int searchEndPosition = packetBuffer.limit();
+    if (packetSize != TsExtractor.TS_PACKET_SIZE) {
+      int pos =
+          TsUtil.findSyncBytePosition(
+              packetBuffer.getData(), searchStartPosition, searchEndPosition, packetSize);
+      while (pos + TsExtractor.TS_PACKET_SIZE <= searchEndPosition) {
+        if (packetBuffer.getData()[pos] == TsExtractor.TS_SYNC_BYTE) {
+          long pcrValue = TsUtil.readPcrFromPacket(packetBuffer, pos, pcrPid);
+          if (pcrValue != C.TIME_UNSET) {
+            return pcrValue;
+          }
+          pos += packetSize;
+        } else {
+          pos =
+              TsUtil.findSyncBytePosition(
+                  packetBuffer.getData(), pos, searchEndPosition, packetSize);
+        }
+      }
+      return C.TIME_UNSET;
+    }
     for (int searchPosition = searchStartPosition;
         searchPosition < searchEndPosition;
         searchPosition++) {
@@ -161,10 +197,15 @@ import java.io.IOException;
     return C.TIME_UNSET;
   }
 
-  private int readLastPcrValue(ExtractorInput input, PositionHolder seekPositionHolder, int pcrPid)
+  private int readLastPcrValue(
+      ExtractorInput input,
+      PositionHolder seekPositionHolder,
+      int pcrPid,
+      int packetSize,
+      int searchBytes)
       throws IOException {
     long inputLength = input.getLength();
-    int bytesToSearch = (int) min(timestampSearchBytes, inputLength);
+    int bytesToSearch = (int) min(searchBytes, inputLength);
     long searchStartPosition = inputLength - bytesToSearch;
     if (input.getPosition() != searchStartPosition) {
       seekPositionHolder.position = searchStartPosition;
@@ -175,12 +216,13 @@ import java.io.IOException;
     input.resetPeekPosition();
     input.peekFully(packetBuffer.getData(), /* offset= */ 0, bytesToSearch);
 
-    lastPcrValue = readLastPcrValueFromBuffer(packetBuffer, pcrPid);
+    lastPcrValue = readLastPcrValueFromBuffer(packetBuffer, pcrPid, packetSize);
     isLastPcrValueRead = true;
     return Extractor.RESULT_CONTINUE;
   }
 
-  private long readLastPcrValueFromBuffer(ParsableByteArray packetBuffer, int pcrPid) {
+  private long readLastPcrValueFromBuffer(
+      ParsableByteArray packetBuffer, int pcrPid, int packetSize) {
     int searchStartPosition = packetBuffer.getPosition();
     int searchEndPosition = packetBuffer.limit();
     // We start searching 'TsExtractor.TS_PACKET_SIZE' bytes from the end to prevent trying to read
@@ -189,7 +231,11 @@ import java.io.IOException;
         searchPosition >= searchStartPosition;
         searchPosition--) {
       if (!TsUtil.isStartOfTsPacket(
-          packetBuffer.getData(), searchStartPosition, searchEndPosition, searchPosition)) {
+          packetBuffer.getData(),
+          searchStartPosition,
+          searchEndPosition,
+          searchPosition,
+          packetSize)) {
         continue;
       }
       long pcrValue = TsUtil.readPcrFromPacket(packetBuffer, searchPosition, pcrPid);
