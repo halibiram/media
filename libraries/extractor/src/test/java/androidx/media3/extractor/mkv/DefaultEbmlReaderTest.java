@@ -131,6 +131,32 @@ public class DefaultEbmlReaderTest {
     assertEvents(input, expected.events);
   }
 
+  @Test
+  public void unknownElementSkippedAndResetsStateBeforeNextElement() throws IOException {
+    // Unknown Void element (0xEC, size 3, 3 payload bytes) followed by EBML_READ_VERSION (0x42F7 = 1).
+    ExtractorInput input =
+        createTestInput(0xEC, 0x83, 0x11, 0x22, 0x33, 0x42, 0xF7, 0x81, 0x01);
+    TestProcessor expected = new TestProcessor();
+    expected.integerElement(TestProcessor.ID_EBML_READ_VERSION, 1);
+    assertEvents(input, expected.events);
+  }
+
+  @Test
+  public void unknownElementInsideMasterFollowedByValidElement() throws IOException {
+    // EBML master (size 10) containing unknown element (0xEC, size 4, 4 bytes) and
+    // DOC_TYPE_READ_VERSION (0x4285, size 1, value 2).
+    ExtractorInput input =
+        createTestInput(
+            0x1A, 0x45, 0xDF, 0xA3, 0x8A,
+            0xEC, 0x84, 0xAA, 0xBB, 0xCC, 0xDD,
+            0x42, 0x85, 0x81, 0x02);
+    TestProcessor expected = new TestProcessor();
+    expected.startMasterElement(TestProcessor.ID_EBML, 5, 10);
+    expected.integerElement(TestProcessor.ID_DOC_TYPE_READ_VERSION, 2);
+    expected.endMasterElement(TestProcessor.ID_EBML);
+    assertEvents(input, expected.events);
+  }
+
   private static void assertEvents(ExtractorInput input, List<String> expectedEvents)
       throws IOException {
     DefaultEbmlReader reader = new DefaultEbmlReader();
