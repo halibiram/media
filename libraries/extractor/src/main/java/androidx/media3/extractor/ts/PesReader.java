@@ -181,6 +181,13 @@ public final class PesReader implements TsPayloadReader {
         && headerParsed;
   }
 
+  /** Flushes any buffered rechunked data on end of input for readers with bounded PES payloads. */
+  /* package */ void flushOnEndOfInput() {
+    if (reader instanceof HdmvTrueHdReader) {
+      reader.packetFinished(/* isEndOfInput= */ true);
+    }
+  }
+
   private void setState(int state) {
     this.state = state;
     bytesRead = 0;

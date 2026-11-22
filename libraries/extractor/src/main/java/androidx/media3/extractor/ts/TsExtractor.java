@@ -129,6 +129,8 @@ public final class TsExtractor implements Extractor {
   public static final int TS_STREAM_TYPE_AC3 = 0x81;
   public static final int TS_STREAM_TYPE_DTS = 0x8A;
   public static final int TS_STREAM_TYPE_HDMV_DTS = 0x82;
+  public static final int TS_STREAM_TYPE_HDMV_TRUEHD = 0x83;
+  public static final int TS_STREAM_TYPE_HDMV_PGS = 0x90;
   public static final int TS_STREAM_TYPE_E_AC3 = 0x87;
   public static final int TS_STREAM_TYPE_AC4 = 0xAC; // DVB/ATSC AC-4 Descriptor
   public static final int TS_STREAM_TYPE_H262 = 0x02;
@@ -455,6 +457,8 @@ public final class TsExtractor implements Extractor {
           PesReader pesReader = (PesReader) payloadReader;
           if (pesReader.canConsumeSynthesizedEmptyPusi(isModeHls)) {
             pesReader.consume(new ParsableByteArray(), FLAG_PAYLOAD_UNIT_START_INDICATOR);
+          } else {
+            pesReader.flushOnEndOfInput();
           }
         }
       }
