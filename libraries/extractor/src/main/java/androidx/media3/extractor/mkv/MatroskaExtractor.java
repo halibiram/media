@@ -55,6 +55,7 @@ import androidx.media3.extractor.HevcConfig;
 import androidx.media3.extractor.MpegAudioUtil;
 import androidx.media3.extractor.PositionHolder;
 import androidx.media3.extractor.SeekMap;
+import androidx.media3.extractor.SeekPoint;
 import androidx.media3.extractor.TrackOutput;
 import androidx.media3.extractor.TrueHdSampleRechunker;
 import androidx.media3.extractor.text.SubtitleParser;
@@ -517,6 +518,9 @@ public class MatroskaExtractor implements Extractor {
   @Nullable private LongArray cueTimesUs;
   @Nullable private LongArray cueClusterPositions;
   private boolean seenClusterPositionForCurrentCuePoint;
+  private boolean usingEstimatedSeekMap;
+  private long estimatedSeekFirstClusterPosition = C.INDEX_UNSET;
+  private boolean resyncToNextClusterAfterSeek;
 
   // Reading state.
   private boolean haveOutputSample;
@@ -632,6 +636,8 @@ public class MatroskaExtractor implements Extractor {
     reader.reset();
     varintReader.reset();
     resetWriteSampleData();
+    resyncToNextClusterAfterSeek =
+        usingEstimatedSeekMap && position > estimatedSeekFirstClusterPosition;
     for (int i = 0; i < tracks.size(); i++) {
       tracks.valueAt(i).reset();
     }
@@ -647,18 +653,27 @@ public class MatroskaExtractor implements Extractor {
     try {
       return readFromInput(input, seekPosition);
     } catch (EOFException e) {
+      if (maybeRecoverFromTruncatedCuesSeek(input, seekPosition)) {
+        return Extractor.RESULT_SEEK;
+      }
       if (sentSeekMap) {
         Log.w(TAG, "MKV stream ended mid-element after seek map; treating as end of input");
         return finishReadAtEndOfInput();
       }
       throw e;
     } catch (ParserException e) {
+      if (isTruncatedEbmlTailError(e) && maybeRecoverFromTruncatedCuesSeek(input, seekPosition)) {
+        return Extractor.RESULT_SEEK;
+      }
       if (shouldTreatEbmlErrorAsEndOfInput(input, e)) {
         Log.w(TAG, "Ignoring truncated MKV tail: " + e.getMessage());
         return finishReadAtEndOfInput();
       }
       throw e;
     } catch (IllegalStateException e) {
+      if (isTruncatedEbmlTailError(e) && maybeRecoverFromTruncatedCuesSeek(input, seekPosition)) {
+        return Extractor.RESULT_SEEK;
+      }
       if (shouldTreatEbmlErrorAsEndOfInput(input, e)) {
         Log.w(TAG, "Ignoring truncated MKV tail: " + e.getMessage());
         return finishReadAtEndOfInput();
@@ -668,6 +683,12 @@ public class MatroskaExtractor implements Extractor {
   }
 
   private int readFromInput(ExtractorInput input, PositionHolder seekPosition) throws IOException {
+    if (resyncToNextClusterAfterSeek) {
+      resyncToNextClusterAfterSeek = false;
+      if (!skipToNextClusterStart(input)) {
+        return finishReadAtEndOfInput();
+      }
+    }
     haveOutputSample = false;
     boolean continueReading = true;
     while (continueReading && !haveOutputSample) {
@@ -684,9 +705,193 @@ public class MatroskaExtractor implements Extractor {
       }
     }
     if (!continueReading) {
+      if (maybeRecoverFromTruncatedCuesSeek(input, seekPosition)) {
+        return Extractor.RESULT_SEEK;
+      }
       return finishReadAtEndOfInput();
     }
     return Extractor.RESULT_CONTINUE;
+  }
+
+  private boolean maybeRecoverFromTruncatedCuesSeek(
+      ExtractorInput input, PositionHolder seekPosition) {
+    if (sentSeekMap || seekPositionAfterBuildingCues == C.INDEX_UNSET) {
+      return false;
+    }
+    long firstClusterPosition = seekPositionAfterBuildingCues;
+    SeekMap recoveredSeekMap = null;
+    if (cueTimesUs != null && cueClusterPositions != null) {
+      int validCueCount = min(cueTimesUs.size(), cueClusterPositions.size());
+      if (validCueCount > 0) {
+        LongArray trimmedTimes = new LongArray(validCueCount);
+        LongArray trimmedPositions = new LongArray(validCueCount);
+        for (int i = 0; i < validCueCount; i++) {
+          trimmedTimes.add(cueTimesUs.get(i));
+          trimmedPositions.add(cueClusterPositions.get(i));
+        }
+        SeekMap candidate = buildSeekMap(trimmedTimes, trimmedPositions);
+        if (candidate.isSeekable()) {
+          recoveredSeekMap = candidate;
+          Log.w(
+              TAG,
+              "MKV Cues truncated at tail; recovered seek map with "
+                  + validCueCount
+                  + " parsed cue points");
+        }
+      }
+    }
+    if (recoveredSeekMap == null) {
+      long inputLength = input.getLength();
+      if (durationUs != C.TIME_UNSET
+          && durationUs > 0
+          && inputLength != C.LENGTH_UNSET
+          && inputLength > firstClusterPosition) {
+        recoveredSeekMap =
+            new EstimatedClusterSeekMap(firstClusterPosition, inputLength, durationUs);
+        usingEstimatedSeekMap = true;
+        estimatedSeekFirstClusterPosition = firstClusterPosition;
+        Log.w(
+            TAG,
+            "MKV Cues tail missing or zero-padded; using estimated cluster-resync seek map");
+      } else {
+        recoveredSeekMap = new SeekMap.Unseekable(durationUs);
+        Log.w(
+            TAG,
+            "MKV Cues tail missing or truncated without known length/duration; unseekable");
+      }
+    }
+    checkNotNull(extractorOutput).seekMap(recoveredSeekMap);
+    sentSeekMap = true;
+    seekForCues = false;
+    seekForSeekHead = false;
+    pendingSeekHeadPosition = C.INDEX_UNSET;
+    cueTimesUs = null;
+    cueClusterPositions = null;
+    seekPosition.position = firstClusterPosition;
+    seekPositionAfterBuildingCues = C.INDEX_UNSET;
+    reader.reset();
+    varintReader.reset();
+    return true;
+  }
+
+  /**
+   * Scans forward from an estimated seek byte offset until the next validated Matroska Cluster
+   * element header ({@code 0x1F43B675}) is found. Leaves the input positioned at the first byte of
+   * that Cluster ID.
+   */
+  private static boolean skipToNextClusterStart(ExtractorInput input) throws IOException {
+    final int bufferSize = 8192;
+    final int overlap = 16;
+    byte[] buf = new byte[bufferSize];
+    while (true) {
+      input.resetPeekPosition();
+      long remaining =
+          input.getLength() != C.LENGTH_UNSET
+              ? max(0L, input.getLength() - input.getPosition())
+              : bufferSize;
+      int toPeek = (int) min(bufferSize, remaining);
+      if (toPeek < 6) {
+        return false;
+      }
+      int peeked = 0;
+      while (peeked < toPeek) {
+        int n = input.peek(buf, peeked, toPeek - peeked);
+        if (n == C.RESULT_END_OF_INPUT) {
+          break;
+        }
+        peeked += n;
+      }
+      if (peeked < 6) {
+        return false;
+      }
+      for (int i = 0; i <= peeked - 6; i++) {
+        if (buf[i] == 0x1F
+            && buf[i + 1] == 0x43
+            && buf[i + 2] == (byte) 0xB6
+            && buf[i + 3] == 0x75
+            && isLikelyClusterHeader(buf, i, peeked)) {
+          input.resetPeekPosition();
+          if (i > 0) {
+            input.skipFully(i);
+          }
+          return true;
+        }
+      }
+      input.resetPeekPosition();
+      int advance = peeked - overlap;
+      if (advance <= 0) {
+        return false;
+      }
+      input.skipFully(advance);
+    }
+  }
+
+  private static boolean isLikelyClusterHeader(byte[] buf, int offset, int limit) {
+    if (offset + 6 > limit) {
+      return false;
+    }
+    int sizeLen = VarintReader.parseUnsignedVarintLength(buf[offset + 4]);
+    if (sizeLen == C.LENGTH_UNSET || sizeLen > 8) {
+      return false;
+    }
+    int childOffset = offset + 4 + sizeLen;
+    if (childOffset + 2 > limit) {
+      return false;
+    }
+    int childId = buf[childOffset] & 0xFF;
+    if (childId == 0xE7) { // Timecode (1-byte ID + 1..8 byte unsigned int)
+      int tcSizeLen = VarintReader.parseUnsignedVarintLength(buf[childOffset + 1]);
+      if (tcSizeLen != 1) {
+        return false;
+      }
+      int tcSize = buf[childOffset + 1] & 0x7F;
+      return tcSize >= 1 && tcSize <= 8;
+    }
+    return childId == 0xA7 // Position
+        || childId == 0xAB // PrevSize
+        || childId == 0xA3 // SimpleBlock
+        || childId == 0xA0; // BlockGroup
+  }
+
+  private static final class EstimatedClusterSeekMap implements SeekMap {
+    private static final long MAX_BACKTRACK_BYTES = 256 * 1024;
+
+    private final long firstClusterPosition;
+    private final long inputLength;
+    private final long durationUs;
+
+    EstimatedClusterSeekMap(long firstClusterPosition, long inputLength, long durationUs) {
+      this.firstClusterPosition = firstClusterPosition;
+      this.inputLength = inputLength;
+      this.durationUs = durationUs;
+    }
+
+    @Override
+    public boolean isSeekable() {
+      return true;
+    }
+
+    @Override
+    public long getDurationUs() {
+      return durationUs;
+    }
+
+    @Override
+    public SeekPoints getSeekPoints(long timeUs) {
+      long clampedTimeUs = Util.constrainValue(timeUs, 0L, durationUs);
+      if (clampedTimeUs == 0L) {
+        return new SeekPoints(new SeekPoint(0L, firstClusterPosition));
+      }
+      long dataBytes = inputLength - firstClusterPosition;
+      long estimatedOffset =
+          firstClusterPosition + (long) (((double) clampedTimeUs / durationUs) * dataBytes);
+      // Step back slightly so scanning forward to the next Cluster lands at or before the target.
+      long backtrack = min(MAX_BACKTRACK_BYTES, dataBytes / 16);
+      long position =
+          Util.constrainValue(
+              estimatedOffset - backtrack, firstClusterPosition, max(firstClusterPosition, inputLength - 1));
+      return new SeekPoints(new SeekPoint(clampedTimeUs, position));
+    }
   }
 
   private int finishReadAtEndOfInput() {

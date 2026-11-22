@@ -137,6 +137,256 @@ public final class MatroskaTruncatedTailTest {
     assertThat(trackOutput.getSampleData(0)).isEqualTo(validSample);
   }
 
+  @Test
+  public void extractor_seekHeadToZeroPaddedTailCuesWithoutDuration_fallsBackToUnseekableAndOutputsSamples()
+      throws Exception {
+    byte[] validSample = new byte[] {0x10, 0x20, 0x30, 0x40};
+    byte[] ebmlHeader =
+        ebmlElement(
+            0x1A45DFA3,
+            concat(
+                ebmlUint(0x42F7, 1),
+                ebmlString(0x4282, "matroska"),
+                ebmlUint(0x4285, 2)));
+    byte[] info = ebmlElement(0x1549A966, ebmlUint(0x2AD7B1, 1_000_000));
+    byte[] trackEntry =
+        ebmlElement(
+            0xAE,
+            concat(
+                ebmlUint(0xD7, 1),
+                ebmlUint(0x83, 1), // Video
+                ebmlString(0x86, "V_VP8")));
+    byte[] tracks = ebmlElement(0x1654AE6B, trackEntry);
+    byte[] simpleBlock =
+        ebmlElement(0xA3, concat(new byte[] {(byte) 0x81, 0x00, 0x00, (byte) 0x80}, validSample));
+    byte[] cluster = ebmlElement(0x1F43B675, concat(ebmlUint(0xE7, 0), simpleBlock));
+
+    // Place SeekHead pointing to Cues at the tail, then replace Cues with zero-padding.
+    int cuesRelPos = 64 + info.length + tracks.length + cluster.length;
+    byte[] seekEntry =
+        ebmlElement(
+            0x4DBB,
+            concat(
+                ebmlElement(0x53AB, new byte[] {0x1C, 0x53, (byte) 0xBB, 0x6B}),
+                ebmlUint(0x53AC, cuesRelPos)));
+    byte[] seekHead = ebmlElement(0x114D9B74, seekEntry);
+    int padSize = 64 - seekHead.length;
+    byte[] voidPad = ebmlElement(0xEC, new byte[padSize - 2]);
+    byte[] segmentBody = concat(seekHead, voidPad, info, tracks, cluster, new byte[128]);
+    byte[] mkv = concat(ebmlHeader, ebmlElement(0x18538067, segmentBody));
+
+    FakeExtractorOutput output = extractAll(mkv);
+    assertThat(output.seekMap).isNotNull();
+    assertThat(output.seekMap.isSeekable()).isFalse();
+    FakeTrackOutput trackOutput = output.trackOutputs.get(1);
+    assertThat(trackOutput.getSampleCount()).isEqualTo(1);
+    assertThat(trackOutput.getSampleData(0)).isEqualTo(validSample);
+  }
+
+  @Test
+  public void extractor_seekHeadToZeroPaddedTailCuesWithDuration_becomesSeekableAndResyncsToCluster()
+      throws Exception {
+    byte[] ebmlHeader =
+        ebmlElement(
+            0x1A45DFA3,
+            concat(
+                ebmlUint(0x42F7, 1),
+                ebmlString(0x4282, "matroska"),
+                ebmlUint(0x4285, 2)));
+    // TimecodeScale = 1ms, Duration = 4000.0 (float32) -> 4s
+    byte[] durationFloat =
+        ebmlElement(0x4489, new byte[] {0x45, 0x7A, 0x00, 0x00}); // 4000.0f
+    byte[] info = ebmlElement(0x1549A966, concat(ebmlUint(0x2AD7B1, 1_000_000), durationFloat));
+    byte[] trackEntry =
+        ebmlElement(
+            0xAE,
+            concat(
+                ebmlUint(0xD7, 1),
+                ebmlUint(0x83, 1),
+                ebmlString(0x86, "V_VP8")));
+    byte[] tracks = ebmlElement(0x1654AE6B, trackEntry);
+
+    byte[] payload = new byte[512];
+    byte[] c0 =
+        ebmlElement(
+            0x1F43B675,
+            concat(
+                ebmlUint(0xE7, 0),
+                ebmlElement(
+                    0xA3, concat(new byte[] {(byte) 0x81, 0x00, 0x00, (byte) 0x80}, payload))));
+    byte[] c1 =
+        ebmlElement(
+            0x1F43B675,
+            concat(
+                ebmlUint(0xE7, 1000),
+                ebmlElement(
+                    0xA3, concat(new byte[] {(byte) 0x81, 0x00, 0x00, (byte) 0x80}, payload))));
+    byte[] c2 =
+        ebmlElement(
+            0x1F43B675,
+            concat(
+                ebmlUint(0xE7, 2000),
+                ebmlElement(
+                    0xA3, concat(new byte[] {(byte) 0x81, 0x00, 0x00, (byte) 0x80}, payload))));
+    byte[] c3 =
+        ebmlElement(
+            0x1F43B675,
+            concat(
+                ebmlUint(0xE7, 3000),
+                ebmlElement(
+                    0xA3, concat(new byte[] {(byte) 0x81, 0x00, 0x00, (byte) 0x80}, payload))));
+    byte[] allClusters = concat(c0, c1, c2, c3);
+
+    int cuesRelPos = 64 + info.length + tracks.length + allClusters.length;
+    byte[] seekEntry =
+        ebmlElement(
+            0x4DBB,
+            concat(
+                ebmlElement(0x53AB, new byte[] {0x1C, 0x53, (byte) 0xBB, 0x6B}),
+                ebmlUint(0x53AC, cuesRelPos)));
+    byte[] seekHead = ebmlElement(0x114D9B74, seekEntry);
+    int padSize = 64 - seekHead.length;
+    byte[] voidPad = ebmlElement(0xEC, new byte[padSize - 2]);
+    byte[] segmentBody = concat(seekHead, voidPad, info, tracks, allClusters, new byte[256]);
+    byte[] mkv = concat(ebmlHeader, ebmlElement(0x18538067, segmentBody));
+
+    MatroskaExtractor extractor =
+        new MatroskaExtractor(
+            SubtitleParser.Factory.UNSUPPORTED, MatroskaExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA);
+    FakeExtractorOutput output = new FakeExtractorOutput();
+    extractor.init(output);
+    FakeExtractorInput input = new FakeExtractorInput.Builder().setData(mkv).build();
+    PositionHolder positionHolder = new PositionHolder();
+    try {
+      while (output.seekMap == null) {
+        int res = extractor.read(input, positionHolder);
+        assertThat(res).isNotEqualTo(Extractor.RESULT_END_OF_INPUT);
+        if (res == Extractor.RESULT_SEEK) {
+          input.setPosition((int) positionHolder.position);
+        }
+      }
+      assertThat(output.seekMap.isSeekable()).isTrue();
+      assertThat(output.seekMap.getDurationUs()).isEqualTo(4_000_000L);
+
+      // Seek to 2.5s -> should land inside mid-stream, resync to a valid Cluster, and emit samples.
+      long seekPos = output.seekMap.getSeekPoints(2_500_000L).first.position;
+      extractor.seek(seekPos, 2_500_000L);
+      input.setPosition((int) seekPos);
+      FakeTrackOutput trackOutput = output.trackOutputs.get(1);
+      int countBeforeSeek = trackOutput.getSampleCount();
+      while (true) {
+        int res = extractor.read(input, positionHolder);
+        if (res == Extractor.RESULT_END_OF_INPUT) {
+          break;
+        }
+        if (res == Extractor.RESULT_SEEK) {
+          input.setPosition((int) positionHolder.position);
+        }
+      }
+      assertThat(trackOutput.getSampleCount()).isGreaterThan(countBeforeSeek);
+      assertThat(trackOutput.getSampleTimeUs(countBeforeSeek)).isAtLeast(1_000_000L);
+
+      // Seeking to 0s should cleanly return to Cluster 0.
+      long zeroPos = output.seekMap.getSeekPoints(0L).first.position;
+      extractor.seek(zeroPos, 0L);
+      input.setPosition((int) zeroPos);
+      int countBeforeZero = trackOutput.getSampleCount();
+      while (trackOutput.getSampleCount() == countBeforeZero) {
+        int res = extractor.read(input, positionHolder);
+        assertThat(res).isNotEqualTo(Extractor.RESULT_END_OF_INPUT);
+        if (res == Extractor.RESULT_SEEK) {
+          input.setPosition((int) positionHolder.position);
+        }
+      }
+      assertThat(trackOutput.getSampleTimeUs(countBeforeZero)).isEqualTo(0L);
+    } finally {
+      extractor.release();
+    }
+  }
+
+  @Test
+  public void extractor_seekHeadToPartiallyTruncatedCues_preservesParsedCuePoints()
+      throws Exception {
+    byte[] ebmlHeader =
+        ebmlElement(
+            0x1A45DFA3,
+            concat(
+                ebmlUint(0x42F7, 1),
+                ebmlString(0x4282, "matroska"),
+                ebmlUint(0x4285, 2)));
+    byte[] durationFloat = ebmlElement(0x4489, new byte[] {0x45, 0x7A, 0x00, 0x00}); // 4000.0f
+    byte[] info = ebmlElement(0x1549A966, concat(ebmlUint(0x2AD7B1, 1_000_000), durationFloat));
+    byte[] trackEntry =
+        ebmlElement(
+            0xAE,
+            concat(
+                ebmlUint(0xD7, 1),
+                ebmlUint(0x83, 1),
+                ebmlString(0x86, "V_VP8")));
+    byte[] tracks = ebmlElement(0x1654AE6B, trackEntry);
+    byte[] sample = new byte[] {0x11, 0x22, 0x33, 0x44};
+    byte[] c0 =
+        ebmlElement(
+            0x1F43B675,
+            concat(
+                ebmlUint(0xE7, 0),
+                ebmlElement(
+                    0xA3, concat(new byte[] {(byte) 0x81, 0x00, 0x00, (byte) 0x80}, sample))));
+    byte[] c1 =
+        ebmlElement(
+            0x1F43B675,
+            concat(
+                ebmlUint(0xE7, 2000),
+                ebmlElement(
+                    0xA3, concat(new byte[] {(byte) 0x81, 0x00, 0x00, (byte) 0x80}, sample))));
+
+    int c0RelPos = 64 + info.length + tracks.length;
+    int c1RelPos = c0RelPos + c0.length;
+    int cuesRelPos = c1RelPos + c1.length;
+
+    byte[] cue0 =
+        ebmlElement(
+            0xBB,
+            concat(
+                ebmlUint(0xB3, 0),
+                ebmlElement(0xB7, concat(ebmlUint(0xF7, 1), ebmlUint(0xF1, c0RelPos)))));
+    byte[] cue1 =
+        ebmlElement(
+            0xBB,
+            concat(
+                ebmlUint(0xB3, 2000),
+                ebmlElement(0xB7, concat(ebmlUint(0xF7, 1), ebmlUint(0xF1, c1RelPos)))));
+    // Truncated 3rd CuePoint: declares CuePoint with CueTime but cuts off before CueTrackPositions.
+    byte[] truncatedCue2 = new byte[] {(byte) 0xBB, (byte) 0x90, (byte) 0xB3, (byte) 0x82, 0x0B, (byte) 0xB8};
+    // Cues header declaring more bytes than remain so it hits EOF mid-Cues!
+    byte[] cuesPartial =
+        concat(
+            new byte[] {0x1C, 0x53, (byte) 0xBB, 0x6B, (byte) (0x80 | (cue0.length + cue1.length + 30))},
+            cue0,
+            cue1,
+            truncatedCue2);
+
+    byte[] seekEntry =
+        ebmlElement(
+            0x4DBB,
+            concat(
+                ebmlElement(0x53AB, new byte[] {0x1C, 0x53, (byte) 0xBB, 0x6B}),
+                ebmlUint(0x53AC, cuesRelPos)));
+    byte[] seekHead = ebmlElement(0x114D9B74, seekEntry);
+    int padSize = 64 - seekHead.length;
+    byte[] voidPad = ebmlElement(0xEC, new byte[padSize - 2]);
+    byte[] segmentBody = concat(seekHead, voidPad, info, tracks, c0, c1, cuesPartial);
+    byte[] mkv = concat(ebmlHeader, ebmlElement(0x18538067, segmentBody));
+
+    FakeExtractorOutput output = extractAll(mkv);
+    assertThat(output.seekMap).isNotNull();
+    assertThat(output.seekMap.isSeekable()).isTrue();
+    // Exact ChunkIndex position for 2.0s must equal segmentContentPosition + c1RelPos
+    long seek2sPos = output.seekMap.getSeekPoints(2_000_000L).first.position;
+    long seek0sPos = output.seekMap.getSeekPoints(0L).first.position;
+    assertThat(seek2sPos - seek0sPos).isEqualTo(c0.length);
+  }
+
   private static FakeExtractorOutput extractAll(byte[] data) throws Exception {
     MatroskaExtractor extractor =
         new MatroskaExtractor(
