@@ -46,6 +46,7 @@ import androidx.media3.container.NalUnitUtil;
 import androidx.media3.extractor.AacUtil;
 import androidx.media3.extractor.AvcConfig;
 import androidx.media3.extractor.ChunkIndex;
+import androidx.media3.extractor.DtsUtil;
 import androidx.media3.extractor.Extractor;
 import androidx.media3.extractor.ExtractorInput;
 import androidx.media3.extractor.ExtractorOutput;
@@ -141,6 +142,11 @@ public class MatroskaExtractor implements Extractor {
   private static final int BLOCK_STATE_START = 0;
   private static final int BLOCK_STATE_HEADER = 1;
   private static final int BLOCK_STATE_DATA = 2;
+
+  // Bounds for the early DTS mime scan that peeks ahead right after the Tracks element.
+  private static final int MAX_EARLY_DTS_SCAN_BYTES = 8 * 1024 * 1024;
+  private static final int MAX_EARLY_DTS_FRAME_BYTES = 256 * 1024;
+  private static final int MAX_EBML_HEADER_SIZE = 12; // 4-byte id + 8-byte data size.
 
   private static final int MAX_SEEK_HEAD_FOLLOWS = 4;
 
@@ -472,6 +478,18 @@ public class MatroskaExtractor implements Extractor {
   private long durationUs = C.TIME_UNSET;
   private boolean isWebm;
 
+  /**
+   * Set when the Tracks master element has been parsed with pending DTS tracks, deferring
+   * publish/finish until {@link #read} regains control so the early DTS scan can refine DTS MIME
+   * types before formats reach the track selector.
+   */
+  private boolean pendingFinishTracks;
+  private boolean tracksEnded;
+
+  // Reused scratch for the early DTS peek scan; grows on demand up to MAX_EARLY_DTS_SCAN_BYTES.
+  private byte[] earlyDtsScanBuffer = new byte[64 * 1024];
+  private int earlyDtsScannedLength;
+
   // The track corresponding to the current TrackEntry element, or null.
   @Nullable private Track currentTrack;
 
@@ -654,6 +672,13 @@ public class MatroskaExtractor implements Extractor {
     boolean continueReading = true;
     while (continueReading && !haveOutputSample) {
       continueReading = reader.read(input);
+      if (pendingFinishTracks) {
+        pendingFinishTracks = false;
+        // Input is positioned right after the Tracks element (typically at the first cluster),
+        // so the early scan can peek the first DTS block before formats are published.
+        analyzePendingDtsTracksEarly(input);
+        finishTracksElement();
+      }
       if (continueReading && maybeSeekForCues(seekPosition, input.getPosition())) {
         return Extractor.RESULT_SEEK;
       }
@@ -665,6 +690,10 @@ public class MatroskaExtractor implements Extractor {
   }
 
   private int finishReadAtEndOfInput() {
+    if (pendingFinishTracks) {
+      pendingFinishTracks = false;
+      finishTracksElement();
+    }
     for (int i = 0; i < tracks.size(); i++) {
       Track track = tracks.valueAt(i);
       track.assertOutputInitialized();
@@ -1012,6 +1041,12 @@ public class MatroskaExtractor implements Extractor {
         break;
       case ID_TRACK_ENTRY:
         Track currentTrack = checkStateNotNull(this.currentTrack);
+        if (tracksEnded) {
+          // Tracks were already read via a SeekHead detour before Clusters; ignore the trailing
+          // duplicate when sequential playback reaches it.
+          this.currentTrack = null;
+          break;
+        }
         if (currentTrack.codecId == null) {
           throw ParserException.createForMalformedContainer(
               "CodecId is missing in TrackEntry element", /* cause= */ null);
@@ -1024,37 +1059,65 @@ public class MatroskaExtractor implements Extractor {
         this.currentTrack = null;
         break;
       case ID_TRACKS:
+        if (tracksEnded) {
+          break;
+        }
         if (tracks.size() == 0) {
           throw ParserException.createForMalformedContainer(
               "No valid tracks were found", /* cause= */ null);
         }
-        extractorOutput.endTracks();
-        if (seekPositionAfterReadingTracks != C.INDEX_UNSET) {
-          if (!sentSeekMap) {
-            if (seekForCuesEnabled && cuesContentPosition != C.INDEX_UNSET) {
-              seekPositionAfterBuildingCues = seekPositionAfterReadingTracks;
-              seekPositionAfterReadingTracks = C.INDEX_UNSET;
-              seekForCues = true;
-            } else if (shouldFollowNestedSeekHead(
-                seekForCuesEnabled,
-                cuesContentPosition,
-                pendingSeekHeadPosition,
-                followedSeekHeadCount)) {
-              seekPositionAfterBuildingCues = seekPositionAfterReadingTracks;
-              seekPositionAfterReadingTracks = C.INDEX_UNSET;
-              seekForSeekHead = true;
-            } else {
-              extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
-              sentSeekMap = true;
-              returnFromTracks = true;
-            }
-          } else {
-            returnFromTracks = true;
-          }
+        if (hasWaitingDtsTrack()) {
+          // Defer publishing DTS formats and endTracks() until read() regains control right
+          // after Tracks so early peek analysis can refine DTS-HD MA / DTS:X before track
+          // selection without blocking endTracks().
+          pendingFinishTracks = true;
+        } else {
+          finishTracksElement();
         }
         break;
       default:
         break;
+    }
+  }
+
+  /**
+   * Publishes any pending track formats, signals {@link ExtractorOutput#endTracks()}, and handles
+   * returning from a Tracks-after-Clusters seek detour.
+   */
+  private void finishTracksElement() {
+    ExtractorOutput output = checkNotNull(extractorOutput);
+    for (int i = 0; i < tracks.size(); i++) {
+      Track track = tracks.valueAt(i);
+      if (!track.formatPublished) {
+        track.assertOutputInitialized();
+        track.output.format(checkNotNull(track.format));
+        track.formatPublished = true;
+      }
+    }
+    output.endTracks();
+    tracksEnded = true;
+    if (seekPositionAfterReadingTracks != C.INDEX_UNSET) {
+      if (!sentSeekMap) {
+        if (seekForCuesEnabled && cuesContentPosition != C.INDEX_UNSET) {
+          seekPositionAfterBuildingCues = seekPositionAfterReadingTracks;
+          seekPositionAfterReadingTracks = C.INDEX_UNSET;
+          seekForCues = true;
+        } else if (shouldFollowNestedSeekHead(
+            seekForCuesEnabled,
+            cuesContentPosition,
+            pendingSeekHeadPosition,
+            followedSeekHeadCount)) {
+          seekPositionAfterBuildingCues = seekPositionAfterReadingTracks;
+          seekPositionAfterReadingTracks = C.INDEX_UNSET;
+          seekForSeekHead = true;
+        } else {
+          output.seekMap(new SeekMap.Unseekable(durationUs));
+          sentSeekMap = true;
+          returnFromTracks = true;
+        }
+      } else {
+        returnFromTracks = true;
+      }
     }
   }
 
@@ -1723,6 +1786,27 @@ public class MatroskaExtractor implements Extractor {
       return finishWriteSampleData();
     }
 
+    if (track.waitingForDtsAnalysis && !sampleEncodingHandled && sampleBytesRead == 0) {
+      Format currentFormat = checkNotNull(track.format);
+      int peekSize = min(size, MAX_EARLY_DTS_FRAME_BYTES);
+      byte[] peekedData = new byte[peekSize];
+      boolean hasPeekData =
+          zlibSampleSource != null
+              ? peekSampleBytesFromBuffer(zlibSampleSource, peekedData, peekSize)
+              : input.peekFully(peekedData, /* offset= */ 0, peekSize, true);
+      if (hasPeekData) {
+        if (zlibSampleSource == null) {
+          input.resetPeekPosition();
+        }
+        String mimeType = DtsUtil.getDtsAudioMimeType(peekedData);
+        if (!mimeType.equals(currentFormat.sampleMimeType)) {
+          track.format = currentFormat.buildUpon().setSampleMimeType(mimeType).build();
+          track.output.format(track.format);
+        }
+      }
+      track.waitingForDtsAnalysis = false;
+    }
+
     if (track.isHevc
         && track.hevcAlternativeTransferSamplesToCheck > 0
         && !sampleEncodingHandled
@@ -2083,6 +2167,223 @@ public class MatroskaExtractor implements Extractor {
       bytesWritten = output.sampleData(input, length, false);
     }
     return bytesWritten;
+  }
+
+  private static boolean peekSampleBytesFromBuffer(
+      ParsableByteArray source, byte[] target, int length) {
+    if (source.bytesLeft() < length) {
+      return false;
+    }
+    int position = source.getPosition();
+    source.readBytes(target, /* offset= */ 0, length);
+    source.setPosition(position);
+    return true;
+  }
+
+  /**
+   * Best-effort refinement of DTS MIME types before track formats are published. Peeks forward up
+   * to {@link #MAX_EARLY_DTS_SCAN_BYTES} right after the Tracks element looking for the first
+   * block of each pending DTS track. Never consumes input and always resets the peek position.
+   */
+  private void analyzePendingDtsTracksEarly(ExtractorInput input) {
+    if (!hasWaitingDtsTrack()) {
+      return;
+    }
+    earlyDtsScannedLength = 0;
+    input.resetPeekPosition();
+    try {
+      scanElementSequence(input, /* cursor= */ 0, MAX_EARLY_DTS_SCAN_BYTES);
+    } catch (IOException | RuntimeException e) {
+      Log.w(TAG, "Early DTS analysis aborted, keeping provisional mime: " + e.getMessage());
+    } finally {
+      earlyDtsScannedLength = 0;
+      try {
+        input.resetPeekPosition();
+      } catch (RuntimeException ignored) {
+        // Nothing to reset.
+      }
+    }
+  }
+
+  private boolean hasWaitingDtsTrack() {
+    for (int i = 0; i < tracks.size(); i++) {
+      if (tracks.valueAt(i).waitingForDtsAnalysis) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private boolean ensureScanBytes(ExtractorInput input, int length) throws IOException {
+    if (length <= earlyDtsScannedLength) {
+      return true;
+    }
+    if (length > MAX_EARLY_DTS_SCAN_BYTES) {
+      return false;
+    }
+    if (earlyDtsScanBuffer.length < length) {
+      int newSize = earlyDtsScanBuffer.length;
+      while (newSize < length) {
+        newSize = min(newSize * 2, MAX_EARLY_DTS_SCAN_BYTES);
+      }
+      earlyDtsScanBuffer = Arrays.copyOf(earlyDtsScanBuffer, newSize);
+    }
+    int bytesToPeek = length - earlyDtsScannedLength;
+    if (!input.peekFully(earlyDtsScanBuffer, earlyDtsScannedLength, bytesToPeek, true)) {
+      return false;
+    }
+    earlyDtsScannedLength = length;
+    return true;
+  }
+
+  private void scanElementSequence(ExtractorInput input, int cursor, int sequenceEnd)
+      throws IOException {
+    while (cursor < sequenceEnd && hasWaitingDtsTrack()) {
+      if (!ensureScanBytes(input, cursor + MAX_EBML_HEADER_SIZE)) {
+        return;
+      }
+      int idLength = ebmlVintLength(earlyDtsScanBuffer[cursor] & 0xFF);
+      if (idLength == 0 || idLength > 4) {
+        return;
+      }
+      long id = readEbmlElementId(cursor, idLength);
+      int sizeOffset = cursor + idLength;
+      int sizeLength = ebmlVintLength(earlyDtsScanBuffer[sizeOffset] & 0xFF);
+      if (sizeLength == 0) {
+        return;
+      }
+      long dataSize = readEbmlVintValue(sizeOffset, sizeLength);
+      boolean unknownSize = dataSize == (1L << (7 * sizeLength)) - 1;
+      int dataStart = sizeOffset + sizeLength;
+      long dataEndLong = unknownSize ? Long.MAX_VALUE : (long) dataStart + dataSize;
+      int dataEnd = dataEndLong > sequenceEnd ? sequenceEnd : (int) dataEndLong;
+
+      if (id == ID_CLUSTER || id == ID_BLOCK_GROUP) {
+        scanElementSequence(input, dataStart, dataEnd);
+        cursor = unknownSize ? sequenceEnd : dataEnd;
+      } else if (id == ID_SIMPLE_BLOCK || id == ID_BLOCK) {
+        analyzeDtsBlock(input, dataStart, dataEnd);
+        if (unknownSize) {
+          return;
+        }
+        cursor = dataEnd;
+      } else {
+        if (unknownSize) {
+          return;
+        }
+        cursor = dataEnd;
+      }
+    }
+  }
+
+  private void analyzeDtsBlock(ExtractorInput input, int dataStart, int dataEnd)
+      throws IOException {
+    if (dataEnd <= dataStart || !ensureScanBytes(input, min(dataEnd, dataStart + 8))) {
+      return;
+    }
+    int trackNumberLength = ebmlVintLength(earlyDtsScanBuffer[dataStart] & 0xFF);
+    if (trackNumberLength == 0) {
+      return;
+    }
+    int trackNumber = (int) readEbmlVintValue(dataStart, trackNumberLength);
+    @Nullable Track track = tracks.get(trackNumber);
+    if (track == null || !track.waitingForDtsAnalysis) {
+      return;
+    }
+    if (track.contentCompressionAlgorithm == CONTENT_COMPRESSION_ZLIB
+        || track.hasContentEncryption
+        || track.sampleStrippedBytes != null) {
+      // Leave for writeSampleData() where decompression / header stripping has run.
+      return;
+    }
+    int pos = dataStart + trackNumberLength;
+    if (pos + 3 > dataEnd) {
+      return;
+    }
+    int flags = earlyDtsScanBuffer[pos + 2] & 0xFF;
+    pos += 3; // Skip the 2-byte timecode and the flags byte.
+    switch ((flags & 0x06) >> 1) {
+      case LACING_XIPH:
+        if (pos >= dataEnd || !ensureScanBytes(input, min(dataEnd, pos + 64))) {
+          return;
+        }
+        int xiphLaces = earlyDtsScanBuffer[pos++] & 0xFF;
+        for (int i = 0; i < xiphLaces && pos < dataEnd; i++) {
+          while (pos < dataEnd && (earlyDtsScanBuffer[pos] & 0xFF) == 0xFF) {
+            pos++;
+            if (!ensureScanBytes(input, min(dataEnd, pos + 1))) {
+              return;
+            }
+          }
+          pos++;
+        }
+        break;
+      case LACING_EBML:
+        if (pos >= dataEnd || !ensureScanBytes(input, min(dataEnd, pos + 16))) {
+          return;
+        }
+        int ebmlLaces = earlyDtsScanBuffer[pos++] & 0xFF;
+        if (ebmlLaces > 0) {
+          for (int i = 0; i < ebmlLaces && pos < dataEnd; i++) {
+            int vintLen = ebmlVintLength(earlyDtsScanBuffer[pos] & 0xFF);
+            if (vintLen == 0) {
+              return;
+            }
+            pos += vintLen;
+            if (!ensureScanBytes(input, min(dataEnd, pos + 8))) {
+              return;
+            }
+          }
+        }
+        break;
+      case LACING_FIXED_SIZE:
+        if (pos >= dataEnd) {
+          return;
+        }
+        pos++; // Lace count.
+        break;
+      default:
+        break; // No lacing.
+    }
+    int frameLength = min(dataEnd - pos, MAX_EARLY_DTS_FRAME_BYTES);
+    if (frameLength < 4 || !ensureScanBytes(input, pos + frameLength)) {
+      return;
+    }
+    String mimeType =
+        DtsUtil.getDtsAudioMimeType(
+            Arrays.copyOfRange(earlyDtsScanBuffer, pos, pos + frameLength));
+    Format currentFormat = checkNotNull(track.format);
+    if (!mimeType.equals(currentFormat.sampleMimeType)) {
+      track.format = currentFormat.buildUpon().setSampleMimeType(mimeType).build();
+    }
+    track.waitingForDtsAnalysis = false;
+  }
+
+  private static int ebmlVintLength(int firstByte) {
+    int mask = 0x80;
+    for (int length = 1; length <= 8; length++) {
+      if ((firstByte & mask) != 0) {
+        return length;
+      }
+      mask >>= 1;
+    }
+    return 0;
+  }
+
+  private long readEbmlElementId(int offset, int length) {
+    long value = 0;
+    for (int i = 0; i < length; i++) {
+      value = (value << 8) | (earlyDtsScanBuffer[offset + i] & 0xFF);
+    }
+    return value;
+  }
+
+  private long readEbmlVintValue(int offset, int length) {
+    long value = earlyDtsScanBuffer[offset] & (0xFF >>> length);
+    for (int i = 1; i < length; i++) {
+      value = (value << 8) | (earlyDtsScanBuffer[offset + i] & 0xFF);
+    }
+    return value;
   }
 
   /**
@@ -2447,6 +2748,8 @@ public class MatroskaExtractor implements Extractor {
     // Set when the output is initialized. nalUnitLengthFieldLength is only set for H264/H265.
     public @MonotonicNonNull TrackOutput output;
     @Nullable public Format format;
+    public boolean formatPublished;
+    public boolean waitingForDtsAnalysis;
     public int nalUnitLengthFieldLength;
     public boolean isHevc;
     // Leading HEVC samples still to scan for an alternative transfer SEI.
@@ -2553,6 +2856,9 @@ public class MatroskaExtractor implements Extractor {
           trueHdSampleRechunker = new TrueHdSampleRechunker();
           break;
         case CODEC_ID_DTS:
+          mimeType = MimeTypes.AUDIO_DTS;
+          waitingForDtsAnalysis = true;
+          break;
         case CODEC_ID_DTS_EXPRESS:
           mimeType = MimeTypes.AUDIO_DTS;
           break;
@@ -2775,7 +3081,10 @@ public class MatroskaExtractor implements Extractor {
 
       this.format = format;
       this.output = output.track(number, type);
-      this.output.format(format);
+      if (!waitingForDtsAnalysis) {
+        this.output.format(format);
+        this.formatPublished = true;
+      }
     }
 
     /** Forces any pending sample metadata to be flushed to the output. */

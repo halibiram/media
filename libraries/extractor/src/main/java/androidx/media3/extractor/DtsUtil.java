@@ -255,6 +255,48 @@ public final class DtsUtil {
   }
 
   /**
+   * Returns the DTS audio MIME type ({@link MimeTypes#AUDIO_DTS}, {@link MimeTypes#AUDIO_DTS_HD},
+   * or {@link MimeTypes#AUDIO_DTS_X}) for the given DTS sample payload.
+   *
+   * @param data The DTS sample data.
+   * @return The detected DTS MIME type.
+   */
+  public static String getDtsAudioMimeType(byte[] data) {
+    if (data.length < 4) {
+      return MimeTypes.AUDIO_DTS;
+    }
+    int word =
+        ((data[0] & 0xFF) << 24)
+            | ((data[1] & 0xFF) << 16)
+            | ((data[2] & 0xFF) << 8)
+            | (data[3] & 0xFF);
+    switch (getFrameType(word)) {
+      case FRAME_TYPE_CORE:
+        if (data.length >= 10) {
+          int frameSize = getDtsFrameSize(data);
+          if (frameSize > 0 && data.length >= frameSize + 4) {
+            int nextWord =
+                ((data[frameSize] & 0xFF) << 24)
+                    | ((data[frameSize + 1] & 0xFF) << 16)
+                    | ((data[frameSize + 2] & 0xFF) << 8)
+                    | (data[frameSize + 3] & 0xFF);
+            if (getFrameType(nextWord) == FRAME_TYPE_EXTENSION_SUBSTREAM) {
+              return MimeTypes.AUDIO_DTS_HD;
+            }
+          }
+        }
+        return MimeTypes.AUDIO_DTS;
+      case FRAME_TYPE_EXTENSION_SUBSTREAM:
+        return MimeTypes.AUDIO_DTS_HD;
+      case FRAME_TYPE_UHD_SYNC:
+      case FRAME_TYPE_UHD_NON_SYNC:
+        return MimeTypes.AUDIO_DTS_X;
+      default:
+        return MimeTypes.AUDIO_DTS;
+    }
+  }
+
+  /**
    * Returns the DTS format given {@code data} containing the DTS Core frame according to ETSI TS
    * 102 114 V1.6.1 (2019-08) subsections 5.3/5.4.
    *
