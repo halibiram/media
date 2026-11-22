@@ -167,12 +167,23 @@ public final class DtsReader implements ElementaryStreamReader {
           if (continueRead(data, headerScratchBytes.getData(), /* targetLength= */ 7)) {
             extensionSubstreamHeaderSize =
                 DtsUtil.parseDtsHdHeaderSize(headerScratchBytes.getData());
+            if (extensionSubstreamHeaderSize < bytesRead
+                || extensionSubstreamHeaderSize > headerScratchBytes.capacity()) {
+              bytesRead = 0;
+              state = STATE_FINDING_SYNC;
+              break;
+            }
             state = STATE_READING_EXTSS_HEADER;
           }
           break;
         case STATE_READING_EXTSS_HEADER:
           if (continueRead(data, headerScratchBytes.getData(), extensionSubstreamHeaderSize)) {
             parseExtensionSubstreamHeader();
+            if (sampleSize < extensionSubstreamHeaderSize) {
+              bytesRead = 0;
+              state = STATE_FINDING_SYNC;
+              break;
+            }
             headerScratchBytes.setPosition(0);
             output.sampleData(headerScratchBytes, extensionSubstreamHeaderSize);
             state = STATE_READING_SAMPLE;
@@ -182,6 +193,11 @@ public final class DtsReader implements ElementaryStreamReader {
           // Read enough bytes to parse the header size information.
           if (continueRead(data, headerScratchBytes.getData(), /* targetLength= */ 6)) {
             uhdHeaderSize = DtsUtil.parseDtsUhdHeaderSize(headerScratchBytes.getData());
+            if (uhdHeaderSize <= 0 || uhdHeaderSize > headerScratchBytes.capacity()) {
+              bytesRead = 0;
+              state = STATE_FINDING_SYNC;
+              break;
+            }
             // Adjust the array read position if data read is more than the actual header size.
             if (bytesRead > uhdHeaderSize) {
               int extraBytes = bytesRead - uhdHeaderSize;

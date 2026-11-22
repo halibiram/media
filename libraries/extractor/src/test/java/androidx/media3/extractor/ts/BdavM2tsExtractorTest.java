@@ -155,6 +155,22 @@ public final class BdavM2tsExtractorTest {
     }
   }
 
+  @Test
+  public void dtsReader_malformedExssHeaderSizeSmallerThanPrefix_resyncsWithoutCrashing()
+      throws Exception {
+    DtsReader reader =
+        new DtsReader(/* language= */ "en", /* roleFlags= */ 0, DtsReader.EXTSS_HEADER_SIZE_MAX, "video/mp2t");
+    FakeExtractorOutput output = new FakeExtractorOutput();
+    reader.createTracks(output, new TsPayloadReader.TrackIdGenerator(1, 10));
+    reader.packetStarted(/* pesTimeUs= */ 0L, TsPayloadReader.FLAG_DATA_ALIGNMENT_INDICATOR);
+
+    // ExSS sync 0x64582025 followed by zero bytes yields nuExtSSHeaderSize = 1 (< 7 bytes already read).
+    byte[] malformedExss =
+        new byte[] {0x64, 0x58, 0x20, 0x25, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44};
+    reader.consume(new androidx.media3.common.util.ParsableByteArray(malformedExss));
+    reader.packetFinished(/* isEndOfInput= */ true);
+  }
+
   private static TsExtractor createExtractor() {
     return new TsExtractor(
         TsExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA, SubtitleParser.Factory.UNSUPPORTED);
