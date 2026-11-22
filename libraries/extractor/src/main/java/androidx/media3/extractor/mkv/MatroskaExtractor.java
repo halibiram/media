@@ -132,6 +132,10 @@ public class MatroskaExtractor implements Extractor {
 
   private static final String TAG = "MatroskaExtractor";
 
+  // Encoders repeat the alternative transfer SEI on random access points, so a few leading
+  // samples cover streams whose first sample does not carry it.
+  private static final int MAX_HEVC_ALTERNATIVE_TRANSFER_SAMPLES = 8;
+
   private static final int UNSET_ENTRY_ID = -1;
 
   private static final int BLOCK_STATE_START = 0;
@@ -1719,6 +1723,17 @@ public class MatroskaExtractor implements Extractor {
       return finishWriteSampleData();
     }
 
+    if (track.isHevc
+        && track.hevcAlternativeTransferSamplesToCheck > 0
+        && !sampleEncodingHandled
+        && sampleBytesRead == 0
+        && zlibSampleSource == null
+        && !track.hasContentEncryption
+        && track.sampleStrippedBytes == null) {
+      track.hevcAlternativeTransferSamplesToCheck--;
+      maybeApplyHevcAlternativeTransfer(input, track, size);
+    }
+
     TrackOutput output = track.output;
     if (!sampleEncodingHandled) {
       if (track.hasContentEncryption) {
@@ -1894,6 +1909,34 @@ public class MatroskaExtractor implements Extractor {
     }
 
     return finishWriteSampleData();
+  }
+
+  /**
+   * Applies the HDR transfer from an HEVC alternative transfer SEI when the container and VUI
+   * declare none, so the decoder and display get HLG for streams that signal it only there.
+   */
+  private void maybeApplyHevcAlternativeTransfer(ExtractorInput input, Track track, int size)
+      throws IOException {
+    Format format = checkNotNull(track.format);
+    if (HevcAlternativeTransferSei.declaresHdrTransfer(format)) {
+      track.hevcAlternativeTransferSamplesToCheck = 0;
+      return;
+    }
+    int preferredTransfer =
+        HevcAlternativeTransferSei.peekPreferredTransfer(
+            input, size, track.nalUnitLengthFieldLength);
+    if (preferredTransfer == Format.NO_VALUE) {
+      return;
+    }
+    track.hevcAlternativeTransferSamplesToCheck = 0;
+    @C.ColorTransfer
+    int colorTransfer = ColorInfo.isoTransferCharacteristicsToColorTransfer(preferredTransfer);
+    if (!HevcAlternativeTransferSei.isHdrTransfer(colorTransfer)) {
+      return;
+    }
+    track.format = HevcAlternativeTransferSei.withColorTransfer(format, colorTransfer);
+    checkNotNull(track.output).format(track.format);
+    Log.i(TAG, "HEVC alternative transfer SEI: preferred transfer " + preferredTransfer);
   }
 
   /**
@@ -2403,7 +2446,11 @@ public class MatroskaExtractor implements Extractor {
 
     // Set when the output is initialized. nalUnitLengthFieldLength is only set for H264/H265.
     public @MonotonicNonNull TrackOutput output;
+    @Nullable public Format format;
     public int nalUnitLengthFieldLength;
+    public boolean isHevc;
+    // Leading HEVC samples still to scan for an alternative transfer SEI.
+    public int hevcAlternativeTransferSamplesToCheck = MAX_HEVC_ALTERNATIVE_TRANSFER_SAMPLES;
 
     /** Initializes the track with an output. */
     @RequiresNonNull("codecId")
@@ -2445,6 +2492,7 @@ public class MatroskaExtractor implements Extractor {
           break;
         case CODEC_ID_H265:
           mimeType = MimeTypes.VIDEO_H265;
+          isHevc = true;
           HevcConfig hevcConfig = HevcConfig.parse(new ParsableByteArray(getCodecPrivate(codecId)));
           initializationData = hevcConfig.initializationData;
           nalUnitLengthFieldLength = hevcConfig.nalUnitLengthFieldLength;
@@ -2725,6 +2773,7 @@ public class MatroskaExtractor implements Extractor {
               .setDrmInitData(drmInitData)
               .build();
 
+      this.format = format;
       this.output = output.track(number, type);
       this.output.format(format);
     }
