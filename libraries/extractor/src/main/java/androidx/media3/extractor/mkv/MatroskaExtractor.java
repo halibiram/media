@@ -2209,6 +2209,11 @@ public class MatroskaExtractor implements Extractor {
     return position;
   }
 
+  /* package */ static boolean isStaleContainerDolbyVisionConfig(
+      boolean hasColorInfo, @C.ColorTransfer int colorTransfer) {
+    return hasColorInfo && colorTransfer == C.COLOR_TRANSFER_SDR;
+  }
+
   private long scaleTimecodeToUs(long unscaledTimecode) throws ParserException {
     if (timecodeScale == C.TIME_UNSET) {
       throw ParserException.createForMalformedContainer(
@@ -2381,7 +2386,7 @@ public class MatroskaExtractor implements Extractor {
     public float whitePointChromaticityY = Format.NO_VALUE;
     public float maxMasteringLuminance = Format.NO_VALUE;
     public float minMasteringLuminance = Format.NO_VALUE;
-    public byte @MonotonicNonNull [] dolbyVisionConfigBytes;
+    @Nullable public byte[] dolbyVisionConfigBytes;
 
     // Audio elements. Initially set to their default values.
     public int channelCount = 1;
@@ -2614,8 +2619,15 @@ public class MatroskaExtractor implements Extractor {
         DolbyVisionConfig dolbyVisionConfig =
             DolbyVisionConfig.parse(new ParsableByteArray(this.dolbyVisionConfigBytes));
         if (dolbyVisionConfig != null) {
-          codecs = dolbyVisionConfig.codecs;
-          mimeType = MimeTypes.VIDEO_DOLBY_VISION;
+          if (isStaleContainerDolbyVisionConfig(hasColorInfo, colorTransfer)) {
+            Log.i(
+                TAG,
+                "Ignoring stale Matroska Dolby Vision config: track color metadata indicates SDR");
+            dolbyVisionConfigBytes = null;
+          } else {
+            codecs = dolbyVisionConfig.codecs;
+            mimeType = MimeTypes.VIDEO_DOLBY_VISION;
+          }
         }
       }
 
