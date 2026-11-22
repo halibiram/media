@@ -485,6 +485,12 @@ public class MatroskaExtractor implements Extractor {
   private boolean seekForSeekHead;
   private int followedSeekHeadCount;
   private long seekPositionAfterBuildingCues = C.INDEX_UNSET;
+  // Tracks placed after the Clusters (the SeekHead points at them): read them before any Cluster.
+  private long tracksContentPosition = C.INDEX_UNSET;
+  private boolean seekForTracks;
+  private boolean seekedForTracks;
+  private boolean returnFromTracks;
+  private long seekPositionAfterReadingTracks = C.INDEX_UNSET;
   private long clusterTimecodeUs = C.TIME_UNSET;
   @Nullable private LongArray cueTimesUs;
   @Nullable private LongArray cueClusterPositions;
@@ -837,6 +843,18 @@ public class MatroskaExtractor implements Extractor {
         seenClusterPositionForCurrentCuePoint = false;
         break;
       case ID_CLUSTER:
+        if (seekPositionAfterReadingTracks != C.INDEX_UNSET) {
+          // The SeekHead's Tracks position led to a Cluster instead; go back and carry on.
+          returnFromTracks = true;
+          break;
+        }
+        if (shouldSeekForTracksBeforeCluster(
+            tracks.size(), tracksContentPosition, contentPosition, seekedForTracks)) {
+          // Tracks come after the Clusters. Read them first, or the Cues step below would end
+          // tracks with none and the player would never start.
+          seekForTracks = true;
+          break;
+        }
         if (!sentSeekMap) {
           // We need to build cues before parsing the cluster.
           if (seekForCuesEnabled && cuesContentPosition != C.INDEX_UNSET) {
@@ -907,6 +925,8 @@ public class MatroskaExtractor implements Extractor {
         }
         if (seekEntryId == ID_CUES) {
           cuesContentPosition = seekEntryPosition;
+        } else if (seekEntryId == ID_TRACKS) {
+          tracksContentPosition = seekEntryPosition;
         } else if (seekEntryId == ID_SEEK_HEAD) {
           pendingSeekHeadPosition =
               nextNestedSeekHeadPosition(
@@ -1005,6 +1025,29 @@ public class MatroskaExtractor implements Extractor {
               "No valid tracks were found", /* cause= */ null);
         }
         extractorOutput.endTracks();
+        if (seekPositionAfterReadingTracks != C.INDEX_UNSET) {
+          if (!sentSeekMap) {
+            if (seekForCuesEnabled && cuesContentPosition != C.INDEX_UNSET) {
+              seekPositionAfterBuildingCues = seekPositionAfterReadingTracks;
+              seekPositionAfterReadingTracks = C.INDEX_UNSET;
+              seekForCues = true;
+            } else if (shouldFollowNestedSeekHead(
+                seekForCuesEnabled,
+                cuesContentPosition,
+                pendingSeekHeadPosition,
+                followedSeekHeadCount)) {
+              seekPositionAfterBuildingCues = seekPositionAfterReadingTracks;
+              seekPositionAfterReadingTracks = C.INDEX_UNSET;
+              seekForSeekHead = true;
+            } else {
+              extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
+              sentSeekMap = true;
+              returnFromTracks = true;
+            }
+          } else {
+            returnFromTracks = true;
+          }
+        }
         break;
       default:
         break;
@@ -2063,6 +2106,19 @@ public class MatroskaExtractor implements Extractor {
    * @return Whether the seek position was updated.
    */
   private boolean maybeSeekForCues(PositionHolder seekPosition, long currentPosition) {
+    if (seekForTracks) {
+      seekForTracks = false;
+      seekedForTracks = true;
+      seekPositionAfterReadingTracks = currentPosition;
+      seekPosition.position = tracksContentPosition;
+      return true;
+    }
+    if (returnFromTracks) {
+      returnFromTracks = false;
+      seekPosition.position = seekPositionAfterReadingTracks;
+      seekPositionAfterReadingTracks = C.INDEX_UNSET;
+      return true;
+    }
     if (seekForSeekHead) {
       long target = pendingSeekHeadPosition;
       pendingSeekHeadPosition = C.INDEX_UNSET;
@@ -2099,6 +2155,17 @@ public class MatroskaExtractor implements Extractor {
       return true;
     }
     return false;
+  }
+
+  /* package */ static boolean shouldSeekForTracksBeforeCluster(
+      int trackCount,
+      long tracksContentPosition,
+      long clusterContentPosition,
+      boolean alreadySought) {
+    return trackCount == 0
+        && !alreadySought
+        && tracksContentPosition != C.INDEX_UNSET
+        && tracksContentPosition > clusterContentPosition;
   }
 
   private void maybeFollowPendingIndexAfterSeekHead() {
