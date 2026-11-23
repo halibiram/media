@@ -1,8 +1,15 @@
 #include <jni.h>
 
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
+#include <errno.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
 
 namespace {
 
@@ -23,7 +30,7 @@ void *allocateZeroedMemory(jint size) {
   // calloc stays on Scudo Primary size-class regions (shared mappings), and
   // its 16-byte alignment is sufficient for NewDirectByteBuffer and the
   // memcpy/NEON based sample pipeline.
-  return std::calloc(1, static_cast<size_t>(size));
+  return calloc(1, static_cast<size_t>(size));
 }
 
 // 1. DefaultAllocatorNative methods
@@ -100,8 +107,8 @@ jboolean copyBetweenDirectBuffers(JNIEnv *env, jclass clazz, jobject source, jin
     return JNI_FALSE;
   }
 
-  std::memcpy(targetAddress + targetOffset, sourceAddress + sourceOffset,
-              static_cast<size_t>(length));
+  memcpy(targetAddress + targetOffset, sourceAddress + sourceOffset,
+         static_cast<size_t>(length));
   return JNI_TRUE;
 }
 
@@ -111,9 +118,9 @@ void nativeCopyAddresses(JNIEnv *env, jclass clazz, jlong sourceAddr, jint sourc
   (void)env;
   (void)clazz;
   if (sourceAddr != 0 && targetAddr != 0 && length > 0) {
-    std::memcpy(reinterpret_cast<uint8_t *>(targetAddr) + targetOffset,
-                reinterpret_cast<const uint8_t *>(sourceAddr) + sourceOffset,
-                static_cast<size_t>(length));
+    memcpy(reinterpret_cast<uint8_t *>(targetAddr) + targetOffset,
+           reinterpret_cast<const uint8_t *>(sourceAddr) + sourceOffset,
+           static_cast<size_t>(length));
   }
 }
 
@@ -129,6 +136,45 @@ jlong getBufferAddress(JNIEnv *env, jclass clazz, jobject buffer) {
   return reinterpret_cast<jlong>(env->GetDirectBufferAddress(buffer));
 }
 
+// 3. PlaybackThreadNative methods (Real-time kernel thread hardening)
+// Uses ONLY Android seccomp-whitelisted Linux syscalls (setpriority, prctl) —
+// works on API 21–36 with zero root and never mutates CPU affinity or unrelated app threads.
+jlong hardenCurrentThread(JNIEnv *env, jclass clazz, jint desiredNice) {
+  (void)env;
+  (void)clazz;
+
+  int targetNice = static_cast<int>(desiredNice);
+  if (targetNice < -19) {
+    targetNice = -19;
+  } else if (targetNice > 0) {
+    targetNice = 0;
+  }
+
+  // Step 1: Escalate Linux CFS priority with graceful fallback ladder.
+  const int ladder[] = {targetNice, -18, -16, -10};
+  for (int candidate : ladder) {
+    if (candidate < targetNice) {
+      continue;
+    }
+    if (setpriority(PRIO_PROCESS, 0, candidate) == 0) {
+      break;
+    }
+  }
+  errno = 0;
+  int achievedNice = getpriority(PRIO_PROCESS, 0);
+  if (errno != 0) {
+    achievedNice = 0;
+  }
+
+  // Step 2: Eliminate Linux hrtimer coalescing slack (default 50us..10ms -> 1ns).
+  int timerSlackSet = (prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0) == 0) ? 1 : 0;
+
+  uint64_t packed = 0;
+  packed |= static_cast<uint64_t>((achievedNice + 20) & 0xFF);
+  packed |= static_cast<uint64_t>(timerSlackSet & 0x1) << 8;
+  return static_cast<jlong>(packed);
+}
+
 // Registration tables
 const JNINativeMethod gAllocatorMethods[] = {
     {"nativeCreateAllocation", "(I)Landroidx/media3/exoplayer/upstream/Allocation;", reinterpret_cast<void *>(createAllocation)},
@@ -141,6 +187,10 @@ const JNINativeMethod gQueueMethods[] = {
     {"nativeCopyBetweenDirectBuffers", "(Ljava/nio/ByteBuffer;ILjava/nio/ByteBuffer;II)Z", reinterpret_cast<void *>(copyBetweenDirectBuffers)},
     {"nativeCopyAddresses", "(JIJII)V", reinterpret_cast<void *>(nativeCopyAddresses)},
     {"nativeGetBufferAddress", "(Ljava/nio/ByteBuffer;)J", reinterpret_cast<void *>(getBufferAddress)}
+};
+
+const JNINativeMethod gPlaybackThreadMethods[] = {
+    {"nativeHardenCurrentThread", "(I)J", reinterpret_cast<void *>(hardenCurrentThread)}
 };
 
 } // namespace
@@ -191,6 +241,19 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
   }
   if (env->RegisterNatives(queueClass, gQueueMethods, sizeof(gQueueMethods) / sizeof(JNINativeMethod)) < 0) {
     return JNI_ERR;
+  }
+
+  // Register PlaybackThreadNative methods (optional-safe in case stripped)
+  jclass playbackThreadClass = env->FindClass("androidx/media3/exoplayer/PlaybackThreadNative");
+  if (playbackThreadClass != nullptr) {
+    if (env->RegisterNatives(
+            playbackThreadClass,
+            gPlaybackThreadMethods,
+            sizeof(gPlaybackThreadMethods) / sizeof(JNINativeMethod)) < 0) {
+      env->ExceptionClear();
+    }
+  } else {
+    env->ExceptionClear();
   }
 
   return JNI_VERSION_1_6;

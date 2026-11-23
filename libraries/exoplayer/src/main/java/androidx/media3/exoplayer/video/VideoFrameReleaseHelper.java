@@ -23,6 +23,7 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Message;
+import android.os.Process;
 import android.view.Choreographer;
 import android.view.Choreographer.FrameCallback;
 import android.view.Display;
@@ -31,9 +32,11 @@ import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.Util;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 /**
@@ -498,6 +501,7 @@ public final class VideoFrameReleaseHelper {
     private final HandlerThread choreographerOwnerThread;
     private @MonotonicNonNull Choreographer choreographer;
     private int observerCount;
+    private boolean priorityBoosted;
 
     public static VSyncSampler getInstance() {
       return INSTANCE;
@@ -516,7 +520,12 @@ public final class VideoFrameReleaseHelper {
      * #sampledVsyncTimeNs}, and hence that the value should be periodically updated.
      */
     public void addObserver() {
-      handler.sendEmptyMessage(MSG_ADD_OBSERVER);
+      int boostFlag =
+          (NuvioEngineConfig.get().isRealtimePlaybackThreadEnabled()
+                  && Thread.currentThread() instanceof PlaybackRealtimeThread)
+              ? 1
+              : 0;
+      handler.obtainMessage(MSG_ADD_OBSERVER, boostFlag, 0).sendToTarget();
     }
 
     /**
@@ -540,7 +549,7 @@ public final class VideoFrameReleaseHelper {
           createChoreographerInstanceInternal();
           return true;
         case MSG_ADD_OBSERVER:
-          addObserverInternal();
+          addObserverInternal(message.arg1 != 0);
           return true;
         case MSG_REMOVE_OBSERVER:
           removeObserverInternal();
@@ -559,8 +568,16 @@ public final class VideoFrameReleaseHelper {
       }
     }
 
-    private void addObserverInternal() {
+    private void addObserverInternal(boolean boostPriority) {
       if (choreographer != null) {
+        if (boostPriority && !priorityBoosted) {
+          try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY);
+            priorityBoosted = true;
+          } catch (Throwable ignored) {
+            // Ignore on restricted environments or JVM unit tests.
+          }
+        }
         observerCount++;
         if (observerCount == 1) {
           choreographer.postFrameCallback(this);
@@ -574,6 +591,14 @@ public final class VideoFrameReleaseHelper {
         if (observerCount == 0) {
           choreographer.removeFrameCallback(this);
           sampledVsyncTimeNs = C.TIME_UNSET;
+          if (priorityBoosted) {
+            try {
+              Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+            } catch (Throwable ignored) {
+              // Ignore on restricted environments or JVM unit tests.
+            }
+            priorityBoosted = false;
+          }
         }
       }
     }

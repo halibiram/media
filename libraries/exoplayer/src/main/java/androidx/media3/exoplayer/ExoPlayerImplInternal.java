@@ -44,6 +44,7 @@ import androidx.media3.common.IllegalSeekPositionException;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.Metadata;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.ParserException;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackException.ErrorCode;
@@ -58,6 +59,7 @@ import androidx.media3.common.util.Clock;
 import androidx.media3.common.util.ConditionVariable;
 import androidx.media3.common.util.HandlerWrapper;
 import androidx.media3.common.util.Log;
+import androidx.media3.common.util.NullableType;
 import androidx.media3.common.util.TraceUtil;
 import androidx.media3.common.util.Util;
 import androidx.media3.datasource.DataSourceException;
@@ -84,6 +86,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Implements the internal behavior of {@link ExoPlayerImpl}. */
 /* package */ final class ExoPlayerImplInternal
@@ -210,6 +214,7 @@ import java.util.Objects;
   private final Timeline.Period period;
   private final long backBufferDurationUs;
   private final boolean retainBackBufferFromKeyframe;
+  private final long discardBufferThrottleMs;
   private final DefaultMediaClock mediaClock;
   private final ArrayList<PendingMessageInfo> pendingMessages;
   private final Clock clock;
@@ -245,8 +250,16 @@ import java.util.Objects;
   private boolean offloadSchedulingEnabled;
   private int enabledRendererCount;
   @Nullable private SeekPosition pendingInitialSeekPosition;
+  private final boolean coalesceContinueLoading;
+  private final boolean realtimeVideoOutputWakeup;
+  private final AtomicBoolean videoOutputWakeupPending = new AtomicBoolean(false);
+  private volatile boolean allowVideoOutputWakeup;
+  private final AtomicReference<@NullableType MediaPeriod> pendingContinueLoadingSource;
   private long rendererPositionUs;
   private long rendererPositionElapsedRealtimeUs;
+  @Nullable private MediaPeriodHolder lastDiscardedPeriodHolder;
+  private long lastDiscardedPositionUs;
+  private long lastDiscardRealtimeMs;
   private int nextPendingMessageIndexHint;
   private boolean deliverPendingMessageAtStartPositionRequired;
   @Nullable private ExoPlaybackException pendingRecoverableRendererError;
@@ -305,6 +318,9 @@ import java.util.Objects;
     lastRebufferRealtimeMs = C.TIME_UNSET;
     backBufferDurationUs = loadControl.getBackBufferDurationUs(playerId);
     retainBackBufferFromKeyframe = loadControl.retainBackBufferFromKeyframe(playerId);
+    pendingContinueLoadingSource = new AtomicReference<>();
+    lastDiscardRealtimeMs = C.TIME_UNSET;
+    rendererPositionElapsedRealtimeUs = C.TIME_UNSET;
     lastPreloadPoolInvalidationTimeline = Timeline.EMPTY;
 
     playbackInfo = PlaybackInfo.createDummy(emptyTrackSelectorResult);
@@ -353,6 +369,15 @@ import java.util.Objects;
     this.playbackLooperProvider =
         (playbackLooperProvider == null) ? new PlaybackLooperProvider() : playbackLooperProvider;
     this.playbackLooper = this.playbackLooperProvider.obtainLooper();
+    // Gate real-time coordination and discard throttling on the actual playback thread instance so
+    // secondary players that supply a standard Looper (e.g., home-screen trailers) stay unaffected.
+    boolean realtimeThreadActive =
+        NuvioEngineConfig.get().isRealtimePlaybackThreadEnabled()
+            && this.playbackLooper.getThread() instanceof PlaybackRealtimeThread;
+    discardBufferThrottleMs =
+        realtimeThreadActive ? NuvioEngineConfig.get().getDiscardBufferThrottleMs() : 0L;
+    coalesceContinueLoading = realtimeThreadActive;
+    realtimeVideoOutputWakeup = realtimeThreadActive;
     handler = clock.createHandler(this.playbackLooper, this);
 
     audioFocusManager = new AudioFocusManager(context, playbackLooper, /* playerControl= */ this);
@@ -618,6 +643,9 @@ import java.util.Objects;
 
   @Override
   public void onContinueLoadingRequested(MediaPeriod source) {
+    if (coalesceContinueLoading && pendingContinueLoadingSource.getAndSet(source) == source) {
+      return;
+    }
     handler.obtainMessage(MSG_SOURCE_CONTINUE_LOADING_REQUESTED, source).sendToTarget();
   }
 
@@ -1249,6 +1277,7 @@ import java.util.Objects;
         maybeContinueLoading();
       }
       resetRendererPosition(discontinuityPositionUs);
+      rendererPositionElapsedRealtimeUs = msToUs(clock.elapsedRealtime());
       // A MediaPeriod may report a discontinuity at the current playback position to ensure the
       // renderers are flushed. Only report the discontinuity externally if the position changed.
       if (discontinuityPositionUs != playbackInfo.positionUs) {
@@ -1265,6 +1294,7 @@ import java.util.Objects;
       rendererPositionUs =
           mediaClock.syncAndGetPositionUs(
               /* isReadingAhead= */ playingPeriodHolder != queue.getReadingPeriod());
+      rendererPositionElapsedRealtimeUs = msToUs(clock.elapsedRealtime());
       long periodPositionUs = playingPeriodHolder.toPeriodTime(rendererPositionUs);
       maybeTriggerPendingMessages(playbackInfo.positionUs, periodPositionUs);
       if (mediaClock.hasSkippedSilenceSinceLastCall()) {
@@ -1329,11 +1359,13 @@ import java.util.Objects;
     long operationStartTimeMs = clock.uptimeMillis();
     // Remove other pending DO_SOME_WORK requests that are handled by this invocation.
     handler.removeMessages(MSG_DO_SOME_WORK);
+    videoOutputWakeupPending.set(false);
 
     updatePeriods();
 
     if (playbackInfo.playbackState == Player.STATE_IDLE
         || playbackInfo.playbackState == Player.STATE_ENDED) {
+      allowVideoOutputWakeup = false;
       // Nothing to do. Prepare (in case of IDLE) or seek (in case of ENDED) will resume.
       return;
     }
@@ -1352,9 +1384,9 @@ import java.util.Objects;
     boolean renderersEnded = true;
     boolean renderersAllowPlayback = true;
     if (playingPeriodHolder.prepared) {
-      rendererPositionElapsedRealtimeUs = msToUs(clock.elapsedRealtime());
-      playingPeriodHolder.mediaPeriod.discardBuffer(
-          playbackInfo.positionUs - backBufferDurationUs, retainBackBufferFromKeyframe);
+      if (rendererPositionElapsedRealtimeUs == C.TIME_UNSET) {
+        rendererPositionElapsedRealtimeUs = msToUs(clock.elapsedRealtime());
+      }
       for (int i = 0; i < renderers.length; i++) {
         RendererHolder renderer = renderers[i];
         if (renderer.getEnabledRendererCount() == 0) {
@@ -1378,6 +1410,7 @@ import java.util.Objects;
           maybeThrowRendererStreamError(/* rendererIndex= */ i);
         }
       }
+      maybeDiscardBuffer(playingPeriodHolder);
     } else {
       playingPeriodHolder.mediaPeriod.maybeThrowPrepareError();
     }
@@ -1458,15 +1491,35 @@ import java.util.Objects;
     requestForRendererSleep = false; // A sleep request is only valid for the current doSomeWork.
 
     if (sleepingForOffload || playbackInfo.playbackState == Player.STATE_ENDED) {
+      allowVideoOutputWakeup = false;
       // No need to schedule next work.
     } else if ((isPlaying || playbackInfo.playbackState == Player.STATE_BUFFERING)
         || (playbackInfo.playbackState == Player.STATE_READY && enabledRendererCount != 0)) {
+      allowVideoOutputWakeup = isPlaying || playbackInfo.playbackState == Player.STATE_BUFFERING;
       // Schedule next work as either we are actively playing, buffering, or we
       // are ready but not playing.
       scheduleNextWork(operationStartTimeMs);
+    } else {
+      allowVideoOutputWakeup = false;
     }
 
     TraceUtil.endSection();
+  }
+
+  private void maybeDiscardBuffer(MediaPeriodHolder playingPeriodHolder) {
+    long discardPositionUs = playbackInfo.positionUs - backBufferDurationUs;
+    long nowMs = clock.elapsedRealtime();
+    if (discardBufferThrottleMs > 0
+        && lastDiscardedPeriodHolder == playingPeriodHolder
+        && discardPositionUs >= lastDiscardedPositionUs
+        && lastDiscardRealtimeMs != C.TIME_UNSET
+        && nowMs - lastDiscardRealtimeMs < discardBufferThrottleMs) {
+      return;
+    }
+    playingPeriodHolder.mediaPeriod.discardBuffer(discardPositionUs, retainBackBufferFromKeyframe);
+    lastDiscardedPeriodHolder = playingPeriodHolder;
+    lastDiscardedPositionUs = discardPositionUs;
+    lastDiscardRealtimeMs = nowMs;
   }
 
   private void maybeTriggerOnRendererReadyChanged(int rendererIndex, boolean allowsPlayback) {
@@ -1750,10 +1803,14 @@ import java.util.Objects;
             periodPositionUs - backBufferDurationUs, retainBackBufferFromKeyframe);
       }
       resetRendererPosition(periodPositionUs);
+      lastDiscardedPeriodHolder = null;
+      lastDiscardRealtimeMs = C.TIME_UNSET;
       maybeContinueLoading();
     } else {
       // New period has not been prepared.
       queue.clear();
+      lastDiscardedPeriodHolder = null;
+      lastDiscardRealtimeMs = C.TIME_UNSET;
       resetRendererPosition(periodPositionUs);
     }
 
@@ -1885,6 +1942,7 @@ import java.util.Objects;
     pendingRecoverableRendererError = null;
     updateRebufferingState(/* isRebuffering= */ false, /* resetLastRebufferRealtimeMs= */ true);
     mediaClock.stop();
+    pendingContinueLoadingSource.set(null);
     rendererPositionUs = MediaPeriodQueue.INITIAL_RENDERER_POSITION_OFFSET_US;
     try {
       disableRenderers();
@@ -1924,6 +1982,8 @@ import java.util.Objects;
     }
 
     queue.clear();
+    lastDiscardedPeriodHolder = null;
+    lastDiscardRealtimeMs = C.TIME_UNSET;
     shouldContinueLoading = false;
 
     Timeline timeline = playbackInfo.timeline;
@@ -3016,6 +3076,7 @@ import java.util.Objects;
   }
 
   private void handleContinueLoadingRequested(MediaPeriod mediaPeriod) {
+    pendingContinueLoadingSource.compareAndSet(mediaPeriod, null);
     if (queue.isLoading(mediaPeriod)) {
       queue.reevaluateBuffer(rendererPositionUs);
       maybeContinueLoading();
@@ -3259,6 +3320,7 @@ import java.util.Objects;
         periodHolder.getRendererOffset(),
         periodHolder.info.id,
         mediaClock);
+    final boolean isVideoRenderer = renderer.getTrackType() == C.TRACK_TYPE_VIDEO;
     renderer.handleMessage(
         Renderer.MSG_SET_WAKEUP_LISTENER,
         new Renderer.WakeupListener() {
@@ -3270,6 +3332,18 @@ import java.util.Objects;
           @Override
           public void onWakeup() {
             if (isDynamicSchedulingEnabled() || offloadSchedulingEnabled) {
+              handler.sendEmptyMessage(MSG_DO_SOME_WORK);
+            }
+          }
+
+          @Override
+          public void onOutputBufferAvailable() {
+            if (isDynamicSchedulingEnabled() || offloadSchedulingEnabled) {
+              handler.sendEmptyMessage(MSG_DO_SOME_WORK);
+            } else if (realtimeVideoOutputWakeup
+                && isVideoRenderer
+                && allowVideoOutputWakeup
+                && videoOutputWakeupPending.compareAndSet(false, true)) {
               handler.sendEmptyMessage(MSG_DO_SOME_WORK);
             }
           }

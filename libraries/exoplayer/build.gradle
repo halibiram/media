@@ -25,6 +25,7 @@ android {
         externalNativeBuild {
             cmake {
                 targets "media3_exoplayer_jni"
+                arguments "-DANDROID_STL=none"
             }
         }
     }

@@ -66,16 +66,35 @@ public final class NuvioEngineConfig {
   /** Nuvio enhanced extractor scratch space size (bytes). */
   public static final int NUVIO_EXTRACTOR_SCRATCH_SIZE = 65536;
 
+  /** Default interval in ms between routine SampleQueue back-buffer discards on the playback thread. */
+  public static final long DEFAULT_DISCARD_BUFFER_THROTTLE_MS = 250L;
+
+  /**
+   * Default per-renderer time slice limit in ms. Kept unset so seek/startup keyframe catch-up runs
+   * at full speed without artificial 10 ms sleep slices between decode-only frames.
+   */
+  public static final long DEFAULT_RENDERER_TIME_LIMIT_MS = C.TIME_UNSET;
+
   private static volatile NuvioEngineConfig instance = stockMode();
 
   private final AllocationMode allocationMode;
   private final DataPipelineMode dataPipelineMode;
   private final int extractorScratchSize;
+  private final boolean asyncAudioSinkEnabled;
+  private final boolean asyncVideoReleaseEnabled;
+  private final boolean realtimePlaybackThreadEnabled;
+  private final long discardBufferThrottleMs;
+  private final long rendererTimeLimitMs;
 
   private NuvioEngineConfig(Builder builder) {
     this.allocationMode = builder.allocationMode;
     this.dataPipelineMode = builder.dataPipelineMode;
     this.extractorScratchSize = builder.extractorScratchSize;
+    this.asyncAudioSinkEnabled = builder.asyncAudioSinkEnabled;
+    this.asyncVideoReleaseEnabled = builder.asyncVideoReleaseEnabled;
+    this.realtimePlaybackThreadEnabled = builder.realtimePlaybackThreadEnabled;
+    this.discardBufferThrottleMs = builder.discardBufferThrottleMs;
+    this.rendererTimeLimitMs = builder.rendererTimeLimitMs;
   }
 
   /** Returns the current global configuration. */
@@ -99,6 +118,10 @@ public final class NuvioEngineConfig {
    *   <li>Native off-heap allocation
    *   <li>Zero-copy data pipeline
    *   <li>64 KB extractor scratch buffer
+   *   <li>Decoupled async audio sink &amp; lock-free clock extrapolation
+   *   <li>Async video output buffer release
+   *   <li>Kernel-hardened real-time playback thread
+   *   <li>Throttled SampleQueue back-buffer discard (250 ms)
    * </ul>
    */
   public static NuvioEngineConfig nuvioMode() {
@@ -106,6 +129,28 @@ public final class NuvioEngineConfig {
         .setAllocationMode(AllocationMode.NATIVE_OFF_HEAP)
         .setDataPipelineMode(DataPipelineMode.ZERO_COPY)
         .setExtractorScratchSize(NUVIO_EXTRACTOR_SCRATCH_SIZE)
+        .setAsyncAudioSinkEnabled(true)
+        .setAsyncVideoReleaseEnabled(true)
+        .setRealtimePlaybackThreadEnabled(true)
+        .setDiscardBufferThrottleMs(DEFAULT_DISCARD_BUFFER_THROTTLE_MS)
+        .setRendererTimeLimitMs(DEFAULT_RENDERER_TIME_LIMIT_MS)
+        .build();
+  }
+
+  /**
+   * Returns a configuration that keeps stock heap allocation and byte[] data pipeline while
+   * enabling decoupled A/V playback threading to prevent playback thread lockups and frame drops.
+   */
+  public static NuvioEngineConfig stockWithDecoupledAvSync() {
+    return new Builder()
+        .setAllocationMode(AllocationMode.STOCK_HEAP)
+        .setDataPipelineMode(DataPipelineMode.STOCK)
+        .setExtractorScratchSize(STOCK_EXTRACTOR_SCRATCH_SIZE)
+        .setAsyncAudioSinkEnabled(true)
+        .setAsyncVideoReleaseEnabled(true)
+        .setRealtimePlaybackThreadEnabled(true)
+        .setDiscardBufferThrottleMs(DEFAULT_DISCARD_BUFFER_THROTTLE_MS)
+        .setRendererTimeLimitMs(DEFAULT_RENDERER_TIME_LIMIT_MS)
         .build();
   }
 
@@ -124,6 +169,19 @@ public final class NuvioEngineConfig {
         .setDataPipelineMode(DataPipelineMode.STOCK)
         .setExtractorScratchSize(STOCK_EXTRACTOR_SCRATCH_SIZE)
         .build();
+  }
+
+  /** Returns a {@link Builder} initialized with this configuration's values. */
+  public Builder buildUpon() {
+    return new Builder()
+        .setAllocationMode(allocationMode)
+        .setDataPipelineMode(dataPipelineMode)
+        .setExtractorScratchSize(extractorScratchSize)
+        .setAsyncAudioSinkEnabled(asyncAudioSinkEnabled)
+        .setAsyncVideoReleaseEnabled(asyncVideoReleaseEnabled)
+        .setRealtimePlaybackThreadEnabled(realtimePlaybackThreadEnabled)
+        .setDiscardBufferThrottleMs(discardBufferThrottleMs)
+        .setRendererTimeLimitMs(rendererTimeLimitMs);
   }
 
   /** Returns the allocation mode. */
@@ -151,11 +209,50 @@ public final class NuvioEngineConfig {
     return dataPipelineMode == DataPipelineMode.ZERO_COPY;
   }
 
+  /** Returns {@code true} if the decoupled asynchronous audio sink thread is enabled. */
+  public boolean isAsyncAudioSinkEnabled() {
+    return asyncAudioSinkEnabled;
+  }
+
+  /** Returns {@code true} if asynchronous video {@code MediaCodec.releaseOutputBuffer} is enabled. */
+  public boolean isAsyncVideoReleaseEnabled() {
+    return asyncVideoReleaseEnabled;
+  }
+
+  /**
+   * Returns {@code true} if the hardened real-time playback thread engine (1 ns timer slack and
+   * urgent audio/media thread priorities) is enabled.
+   */
+  public boolean isRealtimePlaybackThreadEnabled() {
+    return realtimePlaybackThreadEnabled;
+  }
+
+  /**
+   * Returns the minimum interval in milliseconds between routine {@code discardBuffer} calls on
+   * the playback thread, or {@code 0} for stock per-tick behaviour.
+   */
+  public long getDiscardBufferThrottleMs() {
+    return discardBufferThrottleMs;
+  }
+
+  /**
+   * Returns the per-renderer render time limit in milliseconds for {@code MediaCodecRenderer}, or
+   * {@link C#TIME_UNSET} for unlimited.
+   */
+  public long getRendererTimeLimitMs() {
+    return rendererTimeLimitMs;
+  }
+
   /** Builder for {@link NuvioEngineConfig}. */
   public static final class Builder {
     private AllocationMode allocationMode = AllocationMode.STOCK_HEAP;
     private DataPipelineMode dataPipelineMode = DataPipelineMode.STOCK;
     private int extractorScratchSize = STOCK_EXTRACTOR_SCRATCH_SIZE;
+    private boolean asyncAudioSinkEnabled = false;
+    private boolean asyncVideoReleaseEnabled = false;
+    private boolean realtimePlaybackThreadEnabled = false;
+    private long discardBufferThrottleMs = 0L;
+    private long rendererTimeLimitMs = C.TIME_UNSET;
 
     public Builder() {}
 
@@ -174,6 +271,39 @@ public final class NuvioEngineConfig {
     /** Sets the extractor input scratch buffer size in bytes. Default is 4096. */
     public Builder setExtractorScratchSize(int extractorScratchSize) {
       this.extractorScratchSize = extractorScratchSize;
+      return this;
+    }
+
+    /** Sets whether to run AudioTrack writes and clock polling on a dedicated async audio thread. */
+    public Builder setAsyncAudioSinkEnabled(boolean asyncAudioSinkEnabled) {
+      this.asyncAudioSinkEnabled = asyncAudioSinkEnabled;
+      return this;
+    }
+
+    /** Sets whether to offload video {@code MediaCodec.releaseOutputBuffer} to a dedicated thread. */
+    public Builder setAsyncVideoReleaseEnabled(boolean asyncVideoReleaseEnabled) {
+      this.asyncVideoReleaseEnabled = asyncVideoReleaseEnabled;
+      return this;
+    }
+
+    /**
+     * Sets whether to enable the hardened real-time playback thread engine (kernel timer slack
+     * elimination and urgent audio/media thread priorities).
+     */
+    public Builder setRealtimePlaybackThreadEnabled(boolean realtimePlaybackThreadEnabled) {
+      this.realtimePlaybackThreadEnabled = realtimePlaybackThreadEnabled;
+      return this;
+    }
+
+    /** Sets the throttle interval in ms for routine SampleQueue back-buffer discarding. */
+    public Builder setDiscardBufferThrottleMs(long discardBufferThrottleMs) {
+      this.discardBufferThrottleMs = Math.max(0L, discardBufferThrottleMs);
+      return this;
+    }
+
+    /** Sets the per-renderer render time slice limit in ms, or {@link C#TIME_UNSET} for unlimited. */
+    public Builder setRendererTimeLimitMs(long rendererTimeLimitMs) {
+      this.rendererTimeLimitMs = rendererTimeLimitMs;
       return this;
     }
 

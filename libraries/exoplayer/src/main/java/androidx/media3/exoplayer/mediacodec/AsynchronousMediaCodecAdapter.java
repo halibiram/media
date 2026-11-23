@@ -26,6 +26,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.PersistableBundle;
+import android.os.Process;
 import android.view.Surface;
 import androidx.annotation.ChecksSdkIntAtLeast;
 import androidx.annotation.IntDef;
@@ -35,8 +36,10 @@ import androidx.annotation.VisibleForTesting;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.util.TraceUtil;
 import androidx.media3.decoder.CryptoInfo;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import com.google.common.base.Supplier;
 import java.io.IOException;
 import java.lang.annotation.Documented;
@@ -66,12 +69,24 @@ import java.nio.ByteBuffer;
      * @param trackType One of {@link C#TRACK_TYPE_AUDIO} or {@link C#TRACK_TYPE_VIDEO}. Used for
      *     labelling the internal thread accordingly.
      */
+    private static boolean isOnRealtimePlaybackThread() {
+      return NuvioEngineConfig.get().isRealtimePlaybackThreadEnabled()
+          && Thread.currentThread() instanceof PlaybackRealtimeThread;
+    }
+
+    private static HandlerThread createMediaCodecThread(String label) {
+      if (isOnRealtimePlaybackThread()) {
+        return new PlaybackRealtimeThread(label, PlaybackRealtimeThread.PRIORITY_COMPANION_MEDIA);
+      }
+      return new HandlerThread(label);
+    }
+
     public Factory(@C.TrackType int trackType) {
       this(
           /* callbackThreadSupplier= */ () ->
-              new HandlerThread(createCallbackThreadLabel(trackType)),
+              createMediaCodecThread(createCallbackThreadLabel(trackType)),
           /* queueingThreadSupplier= */ () ->
-              new HandlerThread(createQueueingThreadLabel(trackType)));
+              createMediaCodecThread(createQueueingThreadLabel(trackType)));
     }
 
     /**
@@ -120,11 +135,29 @@ import java.nio.ByteBuffer;
           bufferEnqueuer =
               new AsynchronousMediaCodecBufferEnqueuer(codec, queueingThreadSupplier.get());
         }
+        @Nullable AsynchronousMediaCodecBufferReleaser bufferReleaser = null;
+        boolean skipForNonRealtimePlayer =
+            NuvioEngineConfig.get().isRealtimePlaybackThreadEnabled()
+                && !(Thread.currentThread() instanceof PlaybackRealtimeThread);
+        if (NuvioEngineConfig.get().isAsyncVideoReleaseEnabled()
+            && !skipForNonRealtimePlayer
+            && MimeTypes.isVideo(configuration.format.sampleMimeType)) {
+          HandlerThread releaserThread =
+              isOnRealtimePlaybackThread()
+                  ? new PlaybackRealtimeThread(
+                      createReleaserThreadLabel(C.TRACK_TYPE_VIDEO),
+                      PlaybackRealtimeThread.PRIORITY_COMPANION_MEDIA)
+                  : new HandlerThread(
+                      createReleaserThreadLabel(C.TRACK_TYPE_VIDEO),
+                      Process.THREAD_PRIORITY_VIDEO);
+          bufferReleaser = new AsynchronousMediaCodecBufferReleaser(codec, releaserThread);
+        }
         codecAdapter =
             new AsynchronousMediaCodecAdapter(
                 codec,
                 callbackThreadSupplier.get(),
                 bufferEnqueuer,
+                bufferReleaser,
                 configuration.loudnessCodecController);
         TraceUtil.endSection();
         if (configuration.surface == null
@@ -168,6 +201,7 @@ import java.nio.ByteBuffer;
   private final MediaCodec codec;
   private final AsynchronousMediaCodecCallback asynchronousMediaCodecCallback;
   private final MediaCodecBufferEnqueuer bufferEnqueuer;
+  @Nullable private final AsynchronousMediaCodecBufferReleaser bufferReleaser;
   @Nullable private final LoudnessCodecController loudnessCodecController;
 
   private boolean codecReleased;
@@ -177,10 +211,12 @@ import java.nio.ByteBuffer;
       MediaCodec codec,
       HandlerThread callbackThread,
       MediaCodecBufferEnqueuer bufferEnqueuer,
+      @Nullable AsynchronousMediaCodecBufferReleaser bufferReleaser,
       @Nullable LoudnessCodecController loudnessCodecController) {
     this.codec = codec;
     this.asynchronousMediaCodecCallback = new AsynchronousMediaCodecCallback(callbackThread);
     this.bufferEnqueuer = bufferEnqueuer;
+    this.bufferReleaser = bufferReleaser;
     this.loudnessCodecController = loudnessCodecController;
     this.state = STATE_CREATED;
   }
@@ -195,6 +231,9 @@ import java.nio.ByteBuffer;
     codec.configure(mediaFormat, surface, crypto, flags);
     TraceUtil.endSection();
     bufferEnqueuer.start();
+    if (bufferReleaser != null) {
+      bufferReleaser.start();
+    }
     TraceUtil.beginSection("startCodec");
     codec.start();
     TraceUtil.endSection();
@@ -223,23 +262,37 @@ import java.nio.ByteBuffer;
 
   @Override
   public void releaseOutputBuffer(int index, boolean render) {
-    codec.releaseOutputBuffer(index, render);
+    if (bufferReleaser != null) {
+      bufferReleaser.releaseOutputBuffer(index, render);
+    } else {
+      codec.releaseOutputBuffer(index, render);
+    }
   }
 
   @Override
   public void releaseOutputBuffer(int index, long renderTimeStampNs) {
-    codec.releaseOutputBuffer(index, renderTimeStampNs);
+    if (bufferReleaser != null) {
+      bufferReleaser.releaseOutputBuffer(index, renderTimeStampNs);
+    } else {
+      codec.releaseOutputBuffer(index, renderTimeStampNs);
+    }
   }
 
   @Override
   public int dequeueInputBufferIndex() {
     bufferEnqueuer.maybeThrowException();
+    if (bufferReleaser != null) {
+      bufferReleaser.maybeThrowException();
+    }
     return asynchronousMediaCodecCallback.dequeueInputBufferIndex();
   }
 
   @Override
   public int dequeueOutputBufferIndex(MediaCodec.BufferInfo bufferInfo) {
     bufferEnqueuer.maybeThrowException();
+    if (bufferReleaser != null) {
+      bufferReleaser.maybeThrowException();
+    }
     return asynchronousMediaCodecCallback.dequeueOutputBufferIndex(bufferInfo);
   }
 
@@ -264,11 +317,15 @@ import java.nio.ByteBuffer;
   public void flush() {
     // The order of calls is important:
     // 1. Flush the bufferEnqueuer to stop queueing input buffers.
-    // 2. Flush the codec to stop producing available input/output buffers.
-    // 3. Flush the callback so that in-flight callbacks are discarded.
-    // 4. Start the codec. The asynchronous callback will drop pending callbacks and we can start
+    // 2. Flush the bufferReleaser to stop releasing output buffers.
+    // 3. Flush the codec to stop producing available input/output buffers.
+    // 4. Flush the callback so that in-flight callbacks are discarded.
+    // 5. Start the codec. The asynchronous callback will drop pending callbacks and we can start
     //    the codec now.
     bufferEnqueuer.flush();
+    if (bufferReleaser != null) {
+      bufferReleaser.flush();
+    }
     codec.flush();
     asynchronousMediaCodecCallback.flush();
     codec.start();
@@ -279,6 +336,9 @@ import java.nio.ByteBuffer;
     try {
       if (state == STATE_INITIALIZED) {
         bufferEnqueuer.shutdown();
+        if (bufferReleaser != null) {
+          bufferReleaser.shutdown();
+        }
         asynchronousMediaCodecCallback.shutdown();
       }
       state = STATE_SHUT_DOWN;
@@ -320,12 +380,18 @@ import java.nio.ByteBuffer;
 
   @Override
   public void setOutputSurface(Surface surface) {
+    if (bufferReleaser != null) {
+      bufferReleaser.waitUntilIdle();
+    }
     codec.setOutputSurface(surface);
   }
 
   @RequiresApi(35)
   @Override
   public void detachOutputSurface() {
+    if (bufferReleaser != null) {
+      bufferReleaser.waitUntilIdle();
+    }
     codec.detachOutputSurface();
   }
 
@@ -361,6 +427,10 @@ import java.nio.ByteBuffer;
 
   private static String createQueueingThreadLabel(@C.TrackType int trackType) {
     return createThreadLabel(trackType, /* prefix= */ "ExoPlayer:MediaCodecQueueingThread:");
+  }
+
+  private static String createReleaserThreadLabel(@C.TrackType int trackType) {
+    return createThreadLabel(trackType, /* prefix= */ "ExoPlayer:MediaCodecReleaser:");
   }
 
   private static String createThreadLabel(@C.TrackType int trackType, String prefix) {

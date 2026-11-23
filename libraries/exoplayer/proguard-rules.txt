@@ -95,3 +95,7 @@
 -keep class androidx.media3.exoplayer.source.SampleDataQueueNative {
   *;
 }
+
+-keep class androidx.media3.exoplayer.PlaybackThreadNative {
+  *;
+}

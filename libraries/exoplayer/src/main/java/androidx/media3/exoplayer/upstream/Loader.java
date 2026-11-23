@@ -22,6 +22,7 @@ import android.annotation.SuppressLint;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
+import android.os.Process;
 import android.os.SystemClock;
 import androidx.annotation.IntDef;
 import androidx.annotation.Nullable;
@@ -30,7 +31,7 @@ import androidx.media3.common.util.Assertions;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.TraceUtil;
 import androidx.media3.common.util.UnstableApi;
-import androidx.media3.common.util.Util;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import androidx.media3.exoplayer.util.ReleasableExecutor;
 import java.io.IOException;
 import java.lang.annotation.Documented;
@@ -38,6 +39,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Manages the background loading of {@link Loadable}s. */
@@ -235,7 +237,28 @@ public final class Loader implements LoaderErrorThrower {
   public Loader(String threadNameSuffix) {
     this(
         /* downloadExecutor= */ ReleasableExecutor.from(
-            Util.newSingleThreadExecutor(THREAD_NAME_PREFIX + threadNameSuffix),
+            Executors.newSingleThreadExecutor(
+                runnable -> {
+                  boolean boostLoaderPriority =
+                      Thread.currentThread() instanceof PlaybackRealtimeThread;
+                  return new Thread(
+                      () -> {
+                        if (boostLoaderPriority) {
+                          // Boost demuxer/loader above normal background work (0) so it never
+                          // starves high-bitrate 4K streams or seeks, while staying below
+                          // SurfaceFlinger (-8), MediaCodec (-16), and Playback/AudioSink (-19)
+                          // and avoiding starving nice=0 vendor hardware codec HAL services on
+                          // 4-core TVs. Stock mode never hits this branch.
+                          try {
+                            Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY);
+                          } catch (Throwable ignored) {
+                            // Ignore on restricted environments or JVM unit tests.
+                          }
+                        }
+                        runnable.run();
+                      },
+                      THREAD_NAME_PREFIX + threadNameSuffix);
+                }),
             ExecutorService::shutdown));
   }
 

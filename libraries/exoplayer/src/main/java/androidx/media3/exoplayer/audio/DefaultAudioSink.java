@@ -36,6 +36,7 @@ import android.media.AudioTrack;
 import android.media.PlaybackParams;
 import android.media.metrics.LogSessionId;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Pair;
@@ -48,6 +49,7 @@ import androidx.media3.common.AuxEffectInfo;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.audio.AudioProcessingPipeline;
 import androidx.media3.common.audio.AudioProcessor;
@@ -60,6 +62,7 @@ import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.Util;
 import androidx.media3.exoplayer.ExoPlayer.AudioOffloadListener;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import androidx.media3.exoplayer.analytics.PlayerId;
 import androidx.media3.extractor.AacUtil;
 import androidx.media3.extractor.Ac3Util;
@@ -78,6 +81,7 @@ import java.math.RoundingMode;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
@@ -863,9 +867,46 @@ public final class DefaultAudioSink implements AudioSink {
             enableOffloadGapless,
             tunneling);
     if (isAudioTrackInitialized()) {
-      this.pendingConfiguration = pendingConfiguration;
+      if (startMediaTimeUsNeedsInit) {
+        if (pendingConfiguration.canReuseAudioTrack(configuration)) {
+          // Keep the unused pre-warmed AudioTrack when the format is compatible.
+          configuration = pendingConfiguration;
+        } else {
+          // Discard unused pre-warmed AudioTrack immediately so the new format takes over.
+          flush();
+          configuration = pendingConfiguration;
+        }
+      } else {
+        this.pendingConfiguration = pendingConfiguration;
+      }
     } else {
       configuration = pendingConfiguration;
+    }
+  }
+
+  /**
+   * Eagerly creates the underlying {@link AudioTrack} for non-tunneled passthrough playback so
+   * HDMI/eARC direct-output initialization runs in parallel with video decoder startup or seek
+   * keyframe decode.
+   *
+   * @return Whether an {@link AudioTrack} is now initialized and ready for immediate writes.
+   */
+  /* package */ boolean prewarmPassthroughAudioTrack() {
+    if (isAudioTrackInitialized()) {
+      return true;
+    }
+    if (pendingConfiguration != null
+        || configuration == null
+        || configuration.outputMode != OUTPUT_MODE_PASSTHROUGH
+        || configuration.tunneling
+        || hasPendingAudioTrackReleases()) {
+      return false;
+    }
+    try {
+      return initializeAudioTrack();
+    } catch (InitializationException e) {
+      // Defer failure reporting to handleBuffer() so normal retry/fallback logic remains intact.
+      return false;
     }
   }
 
@@ -933,10 +974,14 @@ public final class DefaultAudioSink implements AudioSink {
   @Override
   public void play() {
     playing = true;
-    if (isAudioTrackInitialized()) {
+    if (isAudioTrackInitialized() && !startMediaTimeUsNeedsInit) {
+      boolean wasPlaying = audioTrackPositionTracker.isPlaying();
       audioTrackPositionTracker.start();
       if (!stoppedAudioTrack || isOffloadedPlayback(audioTrack)) {
         audioTrack.play();
+      }
+      if (!wasPlaying) {
+        audioTrackPositionTracker.onAudioTrackPlayStarted();
       }
     }
   }
@@ -1601,7 +1646,7 @@ public final class DefaultAudioSink implements AudioSink {
   @Override
   public void pause() {
     playing = false;
-    if (isAudioTrackInitialized()) {
+    if (isAudioTrackInitialized() && !startMediaTimeUsNeedsInit) {
       audioTrackPositionTracker.pause();
       if (!stoppedAudioTrack || isOffloadedPlayback(audioTrack)) {
         audioTrack.pause();
@@ -1620,6 +1665,7 @@ public final class DefaultAudioSink implements AudioSink {
       if (isOffloadedPlayback(audioTrack)) {
         checkNotNull(offloadStreamEventCallbackV29).unregister(audioTrack);
       }
+      boolean isPassthrough = configuration.outputMode == OUTPUT_MODE_PASSTHROUGH;
       AudioTrackConfig oldAudioTrackConfig = configuration.buildAudioTrackConfig();
       if (pendingConfiguration != null) {
         configuration = pendingConfiguration;
@@ -1633,7 +1679,7 @@ public final class DefaultAudioSink implements AudioSink {
       // We need to release the audio track on every flush because of known issues on some devices
       // See b/7941810 or b/19193985.
       // TODO: b/143500232 - Experiment with not releasing AudioTrack on flush.
-      releaseAudioTrackAsync(audioTrack, listener, oldAudioTrackConfig);
+      releaseAudioTrackAsync(audioTrack, listener, oldAudioTrackConfig, isPassthrough);
       audioTrack = null;
     }
     writeExceptionPendingExceptionHolder.clear();
@@ -2040,15 +2086,38 @@ public final class DefaultAudioSink implements AudioSink {
   }
 
   private static void releaseAudioTrackAsync(
-      AudioTrack audioTrack, @Nullable Listener listener, AudioTrackConfig audioTrackConfig) {
+      AudioTrack audioTrack,
+      @Nullable Listener listener,
+      AudioTrackConfig audioTrackConfig,
+      boolean isPassthrough) {
     // AudioTrack.release can take some time, so we call it on a background thread. The background
     // thread is shared statically to avoid creating many threads when multiple players are released
     // at the same time.
     Handler audioTrackThreadHandler = new Handler(Looper.myLooper());
+    // Passthrough bitstreams have no PCM volume ramp; when AsyncAudioSink is enabled, releasing
+    // with 0ms delay immediately frees exclusive HDMI/eARC direct-output HAL streams during seeks.
+    boolean asyncAudioSinkEnabled =
+        NuvioEngineConfig.get().isAsyncAudioSinkEnabled()
+            && Thread.currentThread() instanceof PlaybackRealtimeThread;
+    long releaseDelayMs =
+        (isPassthrough && asyncAudioSinkEnabled) ? 0L : AUDIO_TRACK_VOLUME_RAMP_TIME_MS;
+    boolean keepPersistentReleaseThread = asyncAudioSinkEnabled;
     synchronized (releaseExecutorLock) {
       if (releaseExecutor == null) {
-        releaseExecutor =
-            Util.newSingleThreadScheduledExecutor("ExoPlayer:AudioTrackReleaseThread");
+        if (keepPersistentReleaseThread) {
+          // Keep a single persistent daemon thread to avoid per-seek Thread::Init / ART
+          // thread-list lock churn.
+          releaseExecutor =
+              Executors.newSingleThreadScheduledExecutor(
+                  runnable -> {
+                    Thread thread = new Thread(runnable, "ExoPlayer:AudioTrackReleaseThread");
+                    thread.setDaemon(true);
+                    return thread;
+                  });
+        } else {
+          releaseExecutor =
+              Util.newSingleThreadScheduledExecutor("ExoPlayer:AudioTrackReleaseThread");
+        }
       }
       pendingReleaseCount++;
       Future<?> ignored =
@@ -2060,23 +2129,21 @@ public final class DefaultAudioSink implements AudioSink {
                   audioTrack.flush();
                   audioTrack.release();
                 } finally {
+                  synchronized (releaseExecutorLock) {
+                    pendingReleaseCount--;
+                    if (pendingReleaseCount == 0 && !keepPersistentReleaseThread) {
+                      releaseExecutor.shutdown();
+                      releaseExecutor = null;
+                    }
+                  }
                   if (listener != null
                       && audioTrackThreadHandler.getLooper().getThread().isAlive()) {
                     audioTrackThreadHandler.post(
                         () -> listener.onAudioTrackReleased(audioTrackConfig));
                   }
-                  synchronized (releaseExecutorLock) {
-                    pendingReleaseCount--;
-                    if (pendingReleaseCount == 0) {
-                      releaseExecutor.shutdown();
-                      releaseExecutor = null;
-                    }
-                  }
                 }
               },
-              // We need to schedule the flush and release with a delay to ensure the audio system
-              // can completely ramp down the audio output after the preceding pause.
-              AUDIO_TRACK_VOLUME_RAMP_TIME_MS,
+              releaseDelayMs,
               MILLISECONDS);
     }
   }
@@ -2098,23 +2165,53 @@ public final class DefaultAudioSink implements AudioSink {
   @RequiresApi(24)
   private static final class OnRoutingChangedListenerApi24 {
 
+    private static final Object routingThreadLock = new Object();
+
+    @GuardedBy("routingThreadLock")
+    @Nullable
+    private static Handler routingHandler;
+
+    private static Handler getRoutingHandler() {
+      synchronized (routingThreadLock) {
+        if (routingHandler == null) {
+          HandlerThread thread = new HandlerThread("ExoPlayer:AudioRouting");
+          thread.setDaemon(true);
+          thread.start();
+          routingHandler = new Handler(thread.getLooper());
+        }
+        return routingHandler;
+      }
+    }
+
     private final AudioTrack audioTrack;
     private final AudioCapabilitiesReceiver capabilitiesReceiver;
+    private final Handler playbackHandler;
+    private final boolean dispatchOffThread;
 
-    @Nullable private OnRoutingChangedListener listener;
+    @Nullable private volatile OnRoutingChangedListener listener;
 
     public OnRoutingChangedListenerApi24(
         AudioTrack audioTrack, AudioCapabilitiesReceiver capabilitiesReceiver) {
       this.audioTrack = audioTrack;
       this.capabilitiesReceiver = capabilitiesReceiver;
+      this.playbackHandler = new Handler(Looper.myLooper());
+      this.dispatchOffThread =
+          NuvioEngineConfig.get().isAsyncAudioSinkEnabled()
+              && Thread.currentThread() instanceof PlaybackRealtimeThread;
       this.listener = this::onRoutingChanged;
-      Handler handler = new Handler(Looper.myLooper());
-      audioTrack.addOnRoutingChangedListener(listener, handler);
+      // When AsyncAudioSink is active, dispatch routing callbacks off the real-time audio thread
+      // so AudioManager.updateAudioPortCache lock contention and capability Binder IPCs never stall
+      // passthrough startup or clock polling.
+      Handler callbackHandler = dispatchOffThread ? getRoutingHandler() : playbackHandler;
+      audioTrack.addOnRoutingChangedListener(listener, callbackHandler);
     }
 
     public void release() {
-      audioTrack.removeOnRoutingChangedListener(checkNotNull(listener));
+      @Nullable OnRoutingChangedListener activeListener = listener;
       listener = null;
+      if (activeListener != null) {
+        audioTrack.removeOnRoutingChangedListener(activeListener);
+      }
     }
 
     private void onRoutingChanged(AudioRouting router) {
@@ -2122,10 +2219,31 @@ public final class DefaultAudioSink implements AudioSink {
         // Stale event.
         return;
       }
-      @Nullable AudioDeviceInfo routedDevice = router.getRoutedDevice();
-      if (routedDevice != null) {
-        capabilitiesReceiver.setRoutedDevice(routedDevice);
+      @Nullable AudioDeviceInfo routedDevice;
+      try {
+        routedDevice = router.getRoutedDevice();
+      } catch (RuntimeException ignored) {
+        return;
       }
+      if (routedDevice == null || listener == null) {
+        return;
+      }
+      if (!dispatchOffThread) {
+        capabilitiesReceiver.setRoutedDevice(routedDevice);
+        return;
+      }
+      @Nullable
+      AudioCapabilities newCapabilities =
+          capabilitiesReceiver.computeCapabilitiesForRoutedDeviceOffThread(routedDevice);
+      if (listener == null) {
+        return;
+      }
+      playbackHandler.post(
+          () -> {
+            if (listener != null) {
+              capabilitiesReceiver.applyRoutedDeviceAndCapabilities(routedDevice, newCapabilities);
+            }
+          });
     }
   }
 

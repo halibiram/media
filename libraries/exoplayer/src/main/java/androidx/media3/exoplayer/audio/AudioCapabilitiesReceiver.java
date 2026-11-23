@@ -64,7 +64,7 @@ public final class AudioCapabilitiesReceiver {
 
   @Nullable private AudioCapabilities audioCapabilities;
   @Nullable private AudioDeviceInfoApi23 routedDevice;
-  private AudioAttributes audioAttributes;
+  private volatile AudioAttributes audioAttributes;
   private boolean registered;
 
   /**
@@ -152,6 +152,38 @@ public final class AudioCapabilitiesReceiver {
     this.routedDevice = routedDevice != null ? new AudioDeviceInfoApi23(routedDevice) : null;
     onNewAudioCapabilities(
         AudioCapabilities.getCapabilitiesInternal(context, audioAttributes, this.routedDevice));
+  }
+
+  /**
+   * Computes {@link AudioCapabilities} for {@code routedDevice} off the playback thread so
+   * AudioManager Binder queries never stall real-time audio writes or clock polling.
+   */
+  @RequiresApi(23)
+  /* package */ AudioCapabilities computeCapabilitiesForRoutedDeviceOffThread(
+      @Nullable AudioDeviceInfo routedDevice) {
+    @Nullable
+    AudioDeviceInfoApi23 deviceApi23 =
+        routedDevice != null ? new AudioDeviceInfoApi23(routedDevice) : null;
+    return AudioCapabilities.getCapabilitiesInternal(context, audioAttributes, deviceApi23);
+  }
+
+  /**
+   * Applies a routed device and precomputed capabilities on the playback looper without performing
+   * synchronous Binder IPCs.
+   */
+  @RequiresApi(23)
+  /* package */ void applyRoutedDeviceAndCapabilities(
+      @Nullable AudioDeviceInfo routedDevice, @Nullable AudioCapabilities precomputedCapabilities) {
+    if (Objects.equals(
+        routedDevice, this.routedDevice == null ? null : this.routedDevice.audioDeviceInfo)) {
+      return;
+    }
+    this.routedDevice = routedDevice != null ? new AudioDeviceInfoApi23(routedDevice) : null;
+    AudioCapabilities capabilities =
+        precomputedCapabilities != null
+            ? precomputedCapabilities
+            : AudioCapabilities.getCapabilitiesInternal(context, audioAttributes, this.routedDevice);
+    onNewAudioCapabilities(capabilities);
   }
 
   /**

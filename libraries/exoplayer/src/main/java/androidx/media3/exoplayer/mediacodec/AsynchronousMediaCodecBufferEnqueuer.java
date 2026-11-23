@@ -32,9 +32,11 @@ import androidx.annotation.VisibleForTesting;
 import androidx.media3.common.util.ConditionVariable;
 import androidx.media3.common.util.NullableType;
 import androidx.media3.decoder.CryptoInfo;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 /**
@@ -48,14 +50,21 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private static final int MSG_QUEUE_SECURE_INPUT_BUFFER = 2;
   private static final int MSG_OPEN_CV = 3;
   private static final int MSG_SET_PARAMETERS = 4;
+  private static final int MAX_LOCK_FREE_POOLED_PARAMS = 32;
 
   @GuardedBy("MESSAGE_PARAMS_INSTANCE_POOL")
   private static final ArrayDeque<MessageParams> MESSAGE_PARAMS_INSTANCE_POOL = new ArrayDeque<>();
+
+  // Lock-free zero-allocation pool used exclusively when Decoupled Playback's
+  // PlaybackRealtimeThread is active so stock mode remains 100% untouched.
+  private static final AtomicReferenceArray<@NullableType MessageParams>
+      LOCK_FREE_PARAMS_INSTANCE_POOL = new AtomicReferenceArray<>(MAX_LOCK_FREE_POOLED_PARAMS);
 
   private static final Object QUEUE_SECURE_LOCK = new Object();
 
   private final MediaCodec codec;
   private final HandlerThread handlerThread;
+  private final boolean useLockFreePool;
   private @MonotonicNonNull Handler handler;
   private final AtomicReference<@NullableType RuntimeException> pendingRuntimeException;
   private final ConditionVariable conditionVariable;
@@ -76,6 +85,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       MediaCodec codec, HandlerThread handlerThread, ConditionVariable conditionVariable) {
     this.codec = codec;
     this.handlerThread = handlerThread;
+    this.useLockFreePool = handlerThread instanceof PlaybackRealtimeThread;
     this.conditionVariable = conditionVariable;
     pendingRuntimeException = new AtomicReference<>();
   }
@@ -245,7 +255,16 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     }
   }
 
-  private static MessageParams getMessageParams() {
+  private MessageParams getMessageParams() {
+    if (useLockFreePool) {
+      for (int i = 0; i < MAX_LOCK_FREE_POOLED_PARAMS; i++) {
+        @Nullable MessageParams params = LOCK_FREE_PARAMS_INSTANCE_POOL.get(i);
+        if (params != null && LOCK_FREE_PARAMS_INSTANCE_POOL.compareAndSet(i, params, null)) {
+          return params;
+        }
+      }
+      return new MessageParams();
+    }
     synchronized (MESSAGE_PARAMS_INSTANCE_POOL) {
       if (MESSAGE_PARAMS_INSTANCE_POOL.isEmpty()) {
         return new MessageParams();
@@ -255,7 +274,16 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     }
   }
 
-  private static void recycleMessageParams(MessageParams params) {
+  private void recycleMessageParams(MessageParams params) {
+    if (useLockFreePool) {
+      for (int i = 0; i < MAX_LOCK_FREE_POOLED_PARAMS; i++) {
+        if (LOCK_FREE_PARAMS_INSTANCE_POOL.get(i) == null
+            && LOCK_FREE_PARAMS_INSTANCE_POOL.compareAndSet(i, null, params)) {
+          return;
+        }
+      }
+      return;
+    }
     synchronized (MESSAGE_PARAMS_INSTANCE_POOL) {
       MESSAGE_PARAMS_INSTANCE_POOL.add(params);
     }

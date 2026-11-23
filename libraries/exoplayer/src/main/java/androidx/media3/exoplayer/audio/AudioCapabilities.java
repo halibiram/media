@@ -41,6 +41,7 @@ import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.audio.AudioManagerCompat;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.Util;
@@ -132,6 +133,14 @@ public final class AudioCapabilities {
       Context context,
       AudioAttributes audioAttributes,
       @Nullable AudioDeviceInfoApi23 routedDevice) {
+    if (SDK_INT >= 33
+        && NuvioEngineConfig.get().isAsyncAudioSinkEnabled()
+        && (Util.isTv(context) || Util.isAutomotive(context))) {
+      // Fast-path: API 33+ TV/Automotive queries direct profiles directly and never uses the
+      // sticky ACTION_HDMI_AUDIO_PLUG intent or routedDevice, avoiding 2 extra Binder IPCs.
+      AudioManager audioManager = AudioManagerCompat.getAudioManager(context);
+      return Api33.getCapabilitiesInternalForDirectPlayback(audioManager, audioAttributes);
+    }
     Intent intent =
         context.registerReceiver(
             /* receiver= */ null, new IntentFilter(AudioManager.ACTION_HDMI_AUDIO_PLUG));
@@ -145,19 +154,19 @@ public final class AudioCapabilities {
       AudioAttributes audioAttributes,
       @Nullable AudioDeviceInfoApi23 routedDevice) {
     AudioManager audioManager = AudioManagerCompat.getAudioManager(context);
-    AudioDeviceInfoApi23 currentDevice =
-        routedDevice != null
-            ? routedDevice
-            : SDK_INT >= 33
-                ? Api33.getDefaultRoutedDeviceForAttributes(audioManager, audioAttributes)
-                : null;
-
     if (SDK_INT >= 33 && (Util.isTv(context) || Util.isAutomotive(context))) {
       // TV or automotive devices generally shouldn't support audio offload for surround encodings,
       // so the encodings we get from AudioManager.getDirectProfilesForAttributes should include
       // the PCM encodings and surround encodings for passthrough mode.
       return Api33.getCapabilitiesInternalForDirectPlayback(audioManager, audioAttributes);
     }
+
+    AudioDeviceInfoApi23 currentDevice =
+        routedDevice != null
+            ? routedDevice
+            : SDK_INT >= 33
+                ? Api33.getDefaultRoutedDeviceForAttributes(audioManager, audioAttributes)
+                : null;
 
     // If a connection to Bluetooth device is detected, we only return the minimum capabilities that
     // is supported by all the devices.

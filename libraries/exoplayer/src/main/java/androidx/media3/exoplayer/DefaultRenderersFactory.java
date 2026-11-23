@@ -28,8 +28,10 @@ import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.media3.common.C;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
+import androidx.media3.exoplayer.audio.AsyncAudioSink;
 import androidx.media3.exoplayer.audio.AudioRendererEventListener;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
@@ -834,10 +836,12 @@ public class DefaultRenderersFactory implements RenderersFactory {
   @Nullable
   protected AudioSink buildAudioSink(
       Context context, boolean enableFloatOutput, boolean enableAudioTrackPlaybackParams) {
-    return new DefaultAudioSink.Builder(context)
-        .setEnableFloatOutput(enableFloatOutput)
-        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-        .build();
+    AudioSink sink =
+        new DefaultAudioSink.Builder(context)
+            .setEnableFloatOutput(enableFloatOutput)
+            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+            .build();
+    return NuvioEngineConfig.get().isAsyncAudioSinkEnabled() ? AsyncAudioSink.wrap(sink) : sink;
   }
 
   @Override

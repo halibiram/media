@@ -24,6 +24,7 @@ import android.os.Process;
 import androidx.annotation.GuardedBy;
 import androidx.annotation.Nullable;
 import androidx.annotation.RestrictTo;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.util.UnstableApi;
 
 /**
@@ -83,8 +84,12 @@ public final class PlaybackLooperProvider {
         checkState(referenceCount == 0 && internalPlaybackThread == null);
         // Note: The documentation for Process.THREAD_PRIORITY_AUDIO that states "Applications can
         // not normally change to this priority" is incorrect.
-        internalPlaybackThread =
-            new HandlerThread("ExoPlayer:Playback", Process.THREAD_PRIORITY_AUDIO);
+        if (NuvioEngineConfig.get().isRealtimePlaybackThreadEnabled()) {
+          internalPlaybackThread = new PlaybackRealtimeThread("ExoPlayer:Playback");
+        } else {
+          internalPlaybackThread =
+              new HandlerThread("ExoPlayer:Playback", Process.THREAD_PRIORITY_AUDIO);
+        }
         internalPlaybackThread.start();
         playbackLooper = internalPlaybackThread.getLooper();
       }

@@ -32,8 +32,10 @@ import androidx.annotation.IntDef;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.media3.common.C;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.util.Clock;
 import androidx.media3.common.util.Util;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import java.lang.annotation.Documented;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
@@ -150,6 +152,12 @@ import java.lang.reflect.Method;
    * smoothing.
    */
   private static final long MAX_POSITION_DRIFT_FOR_SMOOTHING_US = C.MICROS_PER_SECOND;
+
+  /**
+   * Maximum position drift for passthrough startup smoothing (1.5 s) so even large DTS-HD/E-AC3
+   * HAL DMA pre-fill bursts converge smoothly without snapping past the video drop threshold.
+   */
+  private static final long MAX_PASSTHROUGH_POSITION_DRIFT_FOR_SMOOTHING_US = 1_500_000L;
 
   /** The maximum allowed speed change to smooth out position drift in percent. */
   private static final int MAX_POSITION_SMOOTHING_SPEED_CHANGE_PERCENT = 10;
@@ -319,7 +327,15 @@ import java.lang.reflect.Method;
             getMediaDurationForPlayoutDuration(elapsedSystemTimeUs, audioTrackPlaybackSpeed);
         long expectedPositionUs = lastPositionUs + expectedPositionDiffUs;
         long positionDriftUs = Math.abs(expectedPositionUs - positionUs);
-        if (positionDiffUs != 0 && positionDriftUs < MAX_POSITION_DRIFT_FOR_SMOOTHING_US) {
+        boolean decoupledPassthroughSmoothing =
+            !isOutputPcm
+                && NuvioEngineConfig.get().isAsyncAudioSinkEnabled()
+                && Thread.currentThread() instanceof PlaybackRealtimeThread;
+        long maxDriftForSmoothingUs =
+            decoupledPassthroughSmoothing
+                ? MAX_PASSTHROUGH_POSITION_DRIFT_FOR_SMOOTHING_US
+                : MAX_POSITION_DRIFT_FOR_SMOOTHING_US;
+        if (positionDiffUs != 0 && positionDriftUs < maxDriftForSmoothingUs) {
           // Ignore updates without moving position (e.g. stuck audio, not yet started audio). Also
           // ignore updates where the smoothing would take too long and it's preferable to jump to
           // the new timestamp immediately.
@@ -364,6 +380,28 @@ import java.lang.reflect.Method;
     }
     onPositionAdvancingFromPositionUs = getPlaybackHeadPositionUs();
     checkNotNull(audioTimestampPoller).reset();
+  }
+
+  /**
+   * Seeds the position smoother immediately after {@link AudioTrack#play()} returns for
+   * passthrough/non-PCM tracks.
+   *
+   * <p>Direct passthrough HALs (HDMI/eARC) frequently consume an initial 120–200 ms DMA burst from
+   * the AudioTrack FIFO during {@code AudioTrack.play()} itself, causing the very first {@code
+   * getPlaybackHeadPosition()} read to jump +120–200 ms ahead of t=0 and drop 2–3 video frames.
+   * Seeding {@code lastSystemTimeUs} and {@code lastPositionUs} right after {@code play()} engages
+   * the built-in ±10% drift smoother from the very first sample.
+   */
+  public void onAudioTrackPlayStarted() {
+    if (!isOutputPcm
+        && NuvioEngineConfig.get().isAsyncAudioSinkEnabled()
+        && Thread.currentThread() instanceof PlaybackRealtimeThread) {
+      lastSystemTimeUs = clock.nanoTime() / 1000;
+      lastPositionUs =
+          onPositionAdvancingFromPositionUs != C.TIME_UNSET
+              ? onPositionAdvancingFromPositionUs
+              : 0L;
+    }
   }
 
   /** Returns whether the audio track is in the playing state. */

@@ -186,6 +186,15 @@ public interface Renderer extends PlayerMessage.Target {
      * <p>Can be called from any thread.
      */
     void onWakeup();
+
+    /**
+     * Called when an asynchronous codec has a newly decoded output buffer ready to be drained.
+     *
+     * <p>Defaults to {@link #onWakeup()}. Can be called from any thread.
+     */
+    default void onOutputBufferAvailable() {
+      onWakeup();
+    }
   }
 
   /**

@@ -51,6 +51,7 @@ import androidx.annotation.RequiresApi;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.util.Assertions;
 import androidx.media3.common.util.Log;
@@ -67,6 +68,7 @@ import androidx.media3.exoplayer.DecoderReuseEvaluation;
 import androidx.media3.exoplayer.DecoderReuseEvaluation.DecoderDiscardReasons;
 import androidx.media3.exoplayer.ExoPlaybackException;
 import androidx.media3.exoplayer.FormatHolder;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import androidx.media3.exoplayer.analytics.PlayerId;
 import androidx.media3.exoplayer.audio.OggOpusAudioPacketizer;
 import androidx.media3.exoplayer.drm.DrmSession;
@@ -353,6 +355,7 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
   @Nullable private MediaCrypto mediaCrypto;
 
   private long renderTimeLimitMs;
+  private boolean hasExplicitRenderTimeLimit;
   private float currentPlaybackSpeed;
   private float targetPlaybackSpeed;
   @Nullable private MediaCodecAdapter codec;
@@ -475,6 +478,7 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
    */
   public void setRenderTimeLimitMs(long renderTimeLimitMs) {
     this.renderTimeLimitMs = renderTimeLimitMs;
+    this.hasExplicitRenderTimeLimit = true;
   }
 
   @Override
@@ -1345,8 +1349,12 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
   }
 
   private boolean shouldContinueRendering(long renderStartTimeMs) {
-    return renderTimeLimitMs == C.TIME_UNSET
-        || getClock().elapsedRealtime() - renderStartTimeMs < renderTimeLimitMs;
+    long effectiveLimitMs = renderTimeLimitMs;
+    if (!hasExplicitRenderTimeLimit && Thread.currentThread() instanceof PlaybackRealtimeThread) {
+      effectiveLimitMs = NuvioEngineConfig.get().getRendererTimeLimitMs();
+    }
+    return effectiveLimitMs == C.TIME_UNSET
+        || getClock().elapsedRealtime() - renderStartTimeMs < effectiveLimitMs;
   }
 
   private boolean hasOutputBuffer() {
@@ -2137,7 +2145,7 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
       }
 
       this.outputIndex = outputIndex;
-      outputBuffer = codec.getOutputBuffer(outputIndex);
+      outputBuffer = shouldFetchOutputBuffer() ? codec.getOutputBuffer(outputIndex) : null;
 
       // The dequeued buffer is a media buffer. Do some initial setup.
       // It will be processed by calling processOutputBuffer (possibly multiple times).
@@ -2234,6 +2242,16 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
     }
     codecOutputMediaFormat = mediaFormat;
     codecOutputMediaFormatChanged = true;
+  }
+
+  /**
+   * Returns whether {@link MediaCodecAdapter#getOutputBuffer(int)} should be called when an output
+   * buffer is dequeued. Renderers that output directly to a {@link android.view.Surface} without
+   * reading output bytes can return {@code false} to avoid unnecessary JNI calls and internal
+   * {@link MediaCodec} lock contention with asynchronous buffer release.
+   */
+  protected boolean shouldFetchOutputBuffer() {
+    return true;
   }
 
   /**
@@ -2811,7 +2829,7 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
     @Override
     public void onOutputBufferAvailable() {
       if (wakeupListener != null) {
-        wakeupListener.onWakeup();
+        wakeupListener.onOutputBufferAvailable();
       }
     }
   }

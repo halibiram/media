@@ -55,6 +55,7 @@ import androidx.media3.common.DrmInitData;
 import androidx.media3.common.Effect;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Timeline;
 import androidx.media3.common.VideoFrameProcessor;
@@ -73,6 +74,7 @@ import androidx.media3.exoplayer.DecoderReuseEvaluation.DecoderDiscardReasons;
 import androidx.media3.exoplayer.ExoPlaybackException;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.FormatHolder;
+import androidx.media3.exoplayer.PlaybackRealtimeThread;
 import androidx.media3.exoplayer.PlayerMessage.Target;
 import androidx.media3.exoplayer.RendererCapabilities;
 import androidx.media3.exoplayer.ScrubbingModeParameters;
@@ -1584,7 +1586,8 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     if (SDK_INT >= 34
         && (enableMediaCodecBufferDecodeOnlyFlag
             || (scrubbingModeParameters != null && scrubbingModeParameters.useDecodeOnlyFlag)
-            || tunneling)
+            || tunneling
+            || Thread.currentThread() instanceof PlaybackRealtimeThread)
         && isBufferBeforeStartTime(buffer)
         && !isBufferProbablyLastSample(buffer)) {
       // The buffer likely needs to be dropped because its timestamp is less than the start time.
@@ -1786,6 +1789,12 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
         setHdr10PlusInfoV29(checkNotNull(getCodec()), hdr10PlusInfo);
       }
     }
+  }
+
+  @Override
+  protected boolean shouldFetchOutputBuffer() {
+    return !(NuvioEngineConfig.get().isAsyncVideoReleaseEnabled()
+        && Thread.currentThread() instanceof PlaybackRealtimeThread);
   }
 
   @Override
