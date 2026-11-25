@@ -75,6 +75,12 @@ public final class NuvioEngineConfig {
    */
   public static final long DEFAULT_RENDERER_TIME_LIMIT_MS = C.TIME_UNSET;
 
+  /**
+   * Default capacity in bytes for the off-heap circular read-ahead buffer (75% forward / 25% back)
+   * placed in front of progressive extractors in decoupled/Nuvio modes.
+   */
+  public static final int DEFAULT_CIRCULAR_READ_AHEAD_BYTES = 4 * 1024 * 1024;
+
   private static volatile NuvioEngineConfig instance = stockMode();
 
   private final AllocationMode allocationMode;
@@ -85,6 +91,7 @@ public final class NuvioEngineConfig {
   private final boolean realtimePlaybackThreadEnabled;
   private final long discardBufferThrottleMs;
   private final long rendererTimeLimitMs;
+  private final int circularReadAheadBufferBytes;
 
   private NuvioEngineConfig(Builder builder) {
     this.allocationMode = builder.allocationMode;
@@ -95,6 +102,7 @@ public final class NuvioEngineConfig {
     this.realtimePlaybackThreadEnabled = builder.realtimePlaybackThreadEnabled;
     this.discardBufferThrottleMs = builder.discardBufferThrottleMs;
     this.rendererTimeLimitMs = builder.rendererTimeLimitMs;
+    this.circularReadAheadBufferBytes = builder.circularReadAheadBufferBytes;
   }
 
   /** Returns the current global configuration. */
@@ -134,6 +142,7 @@ public final class NuvioEngineConfig {
         .setRealtimePlaybackThreadEnabled(true)
         .setDiscardBufferThrottleMs(DEFAULT_DISCARD_BUFFER_THROTTLE_MS)
         .setRendererTimeLimitMs(DEFAULT_RENDERER_TIME_LIMIT_MS)
+        .setCircularReadAheadBufferBytes(DEFAULT_CIRCULAR_READ_AHEAD_BYTES)
         .build();
   }
 
@@ -151,6 +160,7 @@ public final class NuvioEngineConfig {
         .setRealtimePlaybackThreadEnabled(true)
         .setDiscardBufferThrottleMs(DEFAULT_DISCARD_BUFFER_THROTTLE_MS)
         .setRendererTimeLimitMs(DEFAULT_RENDERER_TIME_LIMIT_MS)
+        .setCircularReadAheadBufferBytes(DEFAULT_CIRCULAR_READ_AHEAD_BYTES)
         .build();
   }
 
@@ -181,7 +191,8 @@ public final class NuvioEngineConfig {
         .setAsyncVideoReleaseEnabled(asyncVideoReleaseEnabled)
         .setRealtimePlaybackThreadEnabled(realtimePlaybackThreadEnabled)
         .setDiscardBufferThrottleMs(discardBufferThrottleMs)
-        .setRendererTimeLimitMs(rendererTimeLimitMs);
+        .setRendererTimeLimitMs(rendererTimeLimitMs)
+        .setCircularReadAheadBufferBytes(circularReadAheadBufferBytes);
   }
 
   /** Returns the allocation mode. */
@@ -243,6 +254,14 @@ public final class NuvioEngineConfig {
     return rendererTimeLimitMs;
   }
 
+  /**
+   * Returns the off-heap circular read-ahead buffer size in bytes for progressive streams, or
+   * {@code 0} when disabled (stock behaviour).
+   */
+  public int getCircularReadAheadBufferBytes() {
+    return circularReadAheadBufferBytes;
+  }
+
   /** Builder for {@link NuvioEngineConfig}. */
   public static final class Builder {
     private AllocationMode allocationMode = AllocationMode.STOCK_HEAP;
@@ -253,6 +272,7 @@ public final class NuvioEngineConfig {
     private boolean realtimePlaybackThreadEnabled = false;
     private long discardBufferThrottleMs = 0L;
     private long rendererTimeLimitMs = C.TIME_UNSET;
+    private int circularReadAheadBufferBytes = 0;
 
     public Builder() {}
 
@@ -304,6 +324,15 @@ public final class NuvioEngineConfig {
     /** Sets the per-renderer render time slice limit in ms, or {@link C#TIME_UNSET} for unlimited. */
     public Builder setRendererTimeLimitMs(long rendererTimeLimitMs) {
       this.rendererTimeLimitMs = rendererTimeLimitMs;
+      return this;
+    }
+
+    /**
+     * Sets the off-heap circular read-ahead buffer size in bytes for progressive streams, or {@code
+     * 0} to disable.
+     */
+    public Builder setCircularReadAheadBufferBytes(int circularReadAheadBufferBytes) {
+      this.circularReadAheadBufferBytes = Math.max(0, circularReadAheadBufferBytes);
       return this;
     }
 

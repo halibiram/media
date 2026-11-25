@@ -254,6 +254,9 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       sampleQueue.release();
     }
     progressiveMediaExtractor.release();
+    if (dataSource instanceof CircularReadAheadDataSource) {
+      ((CircularReadAheadDataSource) dataSource).release();
+    }
   }
 
   @Override

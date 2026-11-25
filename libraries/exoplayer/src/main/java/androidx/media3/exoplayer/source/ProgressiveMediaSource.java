@@ -24,6 +24,7 @@ import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MediaItem;
+import androidx.media3.common.NuvioEngineConfig;
 import androidx.media3.common.Timeline;
 import androidx.media3.common.util.Consumer;
 import androidx.media3.common.util.UnstableApi;
@@ -406,6 +407,12 @@ public final class ProgressiveMediaSource extends BaseMediaSource
       dataSource.addTransferListener(transferListener);
     }
     MediaItem.LocalConfiguration localConfiguration = getLocalConfiguration();
+    int circularReadAheadBytes = NuvioEngineConfig.get().getCircularReadAheadBufferBytes();
+    if (circularReadAheadBytes > 0
+        && singleTrackFormat == null
+        && CircularReadAheadDataSource.shouldWrap(localConfiguration.uri, dataSource)) {
+      dataSource = new CircularReadAheadDataSource(dataSource, circularReadAheadBytes);
+    }
     return new ProgressiveMediaPeriod(
         localConfiguration.uri,
         dataSource,
