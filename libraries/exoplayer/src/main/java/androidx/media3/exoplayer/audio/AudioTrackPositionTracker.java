@@ -221,6 +221,13 @@ import java.lang.reflect.Method;
 
   private long sumRawPlaybackHeadPosition;
 
+  /**
+   * Non-zero when a reused passthrough {@link AudioTrack} retains a monotonic (or delayed-reset)
+   * raw playback head position immediately after {@code pause() + flush()}. Subtracted from the
+   * raw head until either cleared on delayed reset to 0 or the track is released.
+   */
+  private long reusedTrackBaseRawHeadPosition;
+
   private Clock clock;
 
   /**
@@ -273,6 +280,7 @@ import java.lang.reflect.Method;
     rawPlaybackHeadWrapCount = 0;
     expectRawPlaybackHeadReset = false;
     sumRawPlaybackHeadPosition = 0;
+    reusedTrackBaseRawHeadPosition = 0;
     passthroughWorkaroundPauseOffset = 0;
     hasData = false;
     stopTimestampUs = C.TIME_UNSET;
@@ -506,11 +514,52 @@ import java.lang.reflect.Method;
   }
 
   /**
+   * Resets position tracking state after {@link AudioTrack#pause()} + {@link AudioTrack#flush()}
+   * on a reused passthrough {@link AudioTrack} (Kodi {@code AESinkAUDIOTRACK::Flush()} model).
+   *
+   * <p>Records the immediate post-flush raw playback head position so all three Android HAL
+   * behaviours are handled seamlessly:
+   *
+   * <ol>
+   *   <li>Immediate reset to 0 ({@code postFlushRawHead == 0}).
+   *   <li>Delayed reset to 0 on first post-flush play/write (prevents false 32-bit wrap-around as
+   *       in Media3 Issue #3407).
+   *   <li>Monotonic head that never resets to 0 on flush (subtracted via {@link
+   *       #reusedTrackBaseRawHeadPosition}).
+   * </ol>
+   *
+   * @return The raw playback head position observed immediately after {@code flush()}.
+   */
+  public long resetForReusedAudioTrack() {
+    AudioTrack track = checkNotNull(this.audioTrack);
+    resetSyncParams();
+    long postFlushRawHead = 0xFFFFFFFFL & track.getPlaybackHeadPosition();
+    rawPlaybackHeadPosition = postFlushRawHead;
+    reusedTrackBaseRawHeadPosition = postFlushRawHead;
+    rawPlaybackHeadWrapCount = 0;
+    expectRawPlaybackHeadReset = false;
+    sumRawPlaybackHeadPosition = 0;
+    passthroughWorkaroundPauseOffset = 0;
+    hasData = false;
+    stopTimestampUs = C.TIME_UNSET;
+    forceResetWorkaroundTimeMs = C.TIME_UNSET;
+    lastLatencySampleTimeUs = 0;
+    latencyUs = 0;
+    lastRawPlaybackHeadPositionSampleTimeMs = 0;
+    onPositionAdvancingFromPositionUs = C.TIME_UNSET;
+    // Create a fresh AudioTimestampPoller so its initializeSystemTimeUs acts as a post-flush epoch
+    // guard (rejecting stale pre-flush AudioTimestamps) and clears any prior wrap state.
+    audioTimestampPoller = new AudioTimestampPoller(track, listener);
+    return postFlushRawHead;
+  }
+
+  /**
    * Resets the position tracker. Should be called when the audio track previously passed to {@link
    * #setAudioTrack(AudioTrack, boolean, int, int, int)} is no longer in use.
    */
   public void reset() {
     resetSyncParams();
+    reusedTrackBaseRawHeadPosition = 0;
     audioTrack = null;
     audioTimestampPoller = null;
   }
@@ -586,9 +635,16 @@ import java.lang.reflect.Method;
 
     maybeUpdateLatency(systemTimeUs);
 
-    checkNotNull(this.audioTimestampPoller)
-        .maybePollTimestamp(
-            systemTimeUs, audioTrackPlaybackSpeed, getPlaybackHeadPositionEstimateUs(systemTimeUs));
+    // When a reused passthrough AudioTrack kept a non-zero monotonic head across flush(), avoid
+    // polling AudioTimestamp until/unless the HAL resets its head to 0 so monotonic framePosition
+    // values cannot shift the post-seek clock forward on short seeks (<5s).
+    if (reusedTrackBaseRawHeadPosition == 0) {
+      checkNotNull(this.audioTimestampPoller)
+          .maybePollTimestamp(
+              systemTimeUs,
+              audioTrackPlaybackSpeed,
+              getPlaybackHeadPositionEstimateUs(systemTimeUs));
+    }
   }
 
   private void maybeUpdateLatency(long systemTimeUs) {
@@ -694,7 +750,9 @@ import java.lang.reflect.Method;
       updateRawPlaybackHeadPosition(currentTimeMs);
       lastRawPlaybackHeadPositionSampleTimeMs = currentTimeMs;
     }
-    return rawPlaybackHeadPosition + sumRawPlaybackHeadPosition + (rawPlaybackHeadWrapCount << 32);
+    long headPosition =
+        rawPlaybackHeadPosition + sumRawPlaybackHeadPosition + (rawPlaybackHeadWrapCount << 32);
+    return max(0L, headPosition - reusedTrackBaseRawHeadPosition);
   }
 
   private long getSimulatedPlaybackHeadPositionAfterStop() {
@@ -728,7 +786,7 @@ import java.lang.reflect.Method;
       rawPlaybackHeadPosition += passthroughWorkaroundPauseOffset;
     }
 
-    if (SDK_INT <= 29) {
+    if (SDK_INT <= 29 && reusedTrackBaseRawHeadPosition == 0) {
       if (rawPlaybackHeadPosition == 0
           && this.rawPlaybackHeadPosition > 0
           && state == PLAYSTATE_PLAYING) {
@@ -750,6 +808,23 @@ import java.lang.reflect.Method;
       if (expectRawPlaybackHeadReset) {
         sumRawPlaybackHeadPosition += this.rawPlaybackHeadPosition;
         expectRawPlaybackHeadReset = false;
+      } else if (reusedTrackBaseRawHeadPosition > 0
+          && rawPlaybackHeadPosition < reusedTrackBaseRawHeadPosition) {
+        // Delayed HAL playback head reset to 0 after pause()+flush() on a reused passthrough
+        // AudioTrack: clear the base offset and re-arm timestamp polling instead of counting a
+        // spurious 32-bit wrap-around (Media3 Issue #3407).
+        reusedTrackBaseRawHeadPosition = 0;
+        resetSyncParams();
+        if (audioTimestampPoller != null) {
+          audioTimestampPoller.reset();
+        }
+      } else if (!isOutputPcm
+          && NuvioEngineConfig.get().isPassthroughAudioTrackReuseOnFlushEnabled()
+          && this.rawPlaybackHeadPosition < (0xFFFFFFFFL - (long) outputSampleRate * 10L)) {
+        // Kodi minwrapvalue guard (Issue #3407): a backward jump far below UINT32_MAX on a
+        // passthrough AudioTrack is a HAL reset/glitch, never a genuine 2^32 (~24.8h) wrap.
+        reusedTrackBaseRawHeadPosition = 0;
+        resetSyncParams();
       } else {
         // The value must have wrapped around.
         rawPlaybackHeadWrapCount++;

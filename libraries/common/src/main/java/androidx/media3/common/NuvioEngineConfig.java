@@ -92,6 +92,7 @@ public final class NuvioEngineConfig {
   private final long discardBufferThrottleMs;
   private final long rendererTimeLimitMs;
   private final int circularReadAheadBufferBytes;
+  private final boolean passthroughAudioTrackReuseOnFlushEnabled;
 
   private NuvioEngineConfig(Builder builder) {
     this.allocationMode = builder.allocationMode;
@@ -103,6 +104,8 @@ public final class NuvioEngineConfig {
     this.discardBufferThrottleMs = builder.discardBufferThrottleMs;
     this.rendererTimeLimitMs = builder.rendererTimeLimitMs;
     this.circularReadAheadBufferBytes = builder.circularReadAheadBufferBytes;
+    this.passthroughAudioTrackReuseOnFlushEnabled =
+        builder.passthroughAudioTrackReuseOnFlushEnabled;
   }
 
   /** Returns the current global configuration. */
@@ -143,6 +146,7 @@ public final class NuvioEngineConfig {
         .setDiscardBufferThrottleMs(DEFAULT_DISCARD_BUFFER_THROTTLE_MS)
         .setRendererTimeLimitMs(DEFAULT_RENDERER_TIME_LIMIT_MS)
         .setCircularReadAheadBufferBytes(DEFAULT_CIRCULAR_READ_AHEAD_BYTES)
+        .setPassthroughAudioTrackReuseOnFlushEnabled(true)
         .build();
   }
 
@@ -161,6 +165,7 @@ public final class NuvioEngineConfig {
         .setDiscardBufferThrottleMs(DEFAULT_DISCARD_BUFFER_THROTTLE_MS)
         .setRendererTimeLimitMs(DEFAULT_RENDERER_TIME_LIMIT_MS)
         .setCircularReadAheadBufferBytes(DEFAULT_CIRCULAR_READ_AHEAD_BYTES)
+        .setPassthroughAudioTrackReuseOnFlushEnabled(true)
         .build();
   }
 
@@ -192,7 +197,8 @@ public final class NuvioEngineConfig {
         .setRealtimePlaybackThreadEnabled(realtimePlaybackThreadEnabled)
         .setDiscardBufferThrottleMs(discardBufferThrottleMs)
         .setRendererTimeLimitMs(rendererTimeLimitMs)
-        .setCircularReadAheadBufferBytes(circularReadAheadBufferBytes);
+        .setCircularReadAheadBufferBytes(circularReadAheadBufferBytes)
+        .setPassthroughAudioTrackReuseOnFlushEnabled(passthroughAudioTrackReuseOnFlushEnabled);
   }
 
   /** Returns the allocation mode. */
@@ -262,6 +268,15 @@ public final class NuvioEngineConfig {
     return circularReadAheadBufferBytes;
   }
 
+  /**
+   * Returns {@code true} if compatible non-tunneled passthrough {@code AudioTrack} instances should
+   * be flushed and reused on seek instead of released and recreated (avoiding AVR HDMI re-lock
+   * silence gaps and {@code AudioManager.updateAudioPortCache} contention).
+   */
+  public boolean isPassthroughAudioTrackReuseOnFlushEnabled() {
+    return passthroughAudioTrackReuseOnFlushEnabled;
+  }
+
   /** Builder for {@link NuvioEngineConfig}. */
   public static final class Builder {
     private AllocationMode allocationMode = AllocationMode.STOCK_HEAP;
@@ -273,6 +288,7 @@ public final class NuvioEngineConfig {
     private long discardBufferThrottleMs = 0L;
     private long rendererTimeLimitMs = C.TIME_UNSET;
     private int circularReadAheadBufferBytes = 0;
+    private boolean passthroughAudioTrackReuseOnFlushEnabled = false;
 
     public Builder() {}
 
@@ -333,6 +349,16 @@ public final class NuvioEngineConfig {
      */
     public Builder setCircularReadAheadBufferBytes(int circularReadAheadBufferBytes) {
       this.circularReadAheadBufferBytes = Math.max(0, circularReadAheadBufferBytes);
+      return this;
+    }
+
+    /**
+     * Sets whether to reuse compatible non-tunneled passthrough {@code AudioTrack} instances on
+     * seek flushes via {@code pause() + flush()} instead of releasing and recreating them.
+     */
+    public Builder setPassthroughAudioTrackReuseOnFlushEnabled(
+        boolean passthroughAudioTrackReuseOnFlushEnabled) {
+      this.passthroughAudioTrackReuseOnFlushEnabled = passthroughAudioTrackReuseOnFlushEnabled;
       return this;
     }
 

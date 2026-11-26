@@ -620,6 +620,7 @@ public final class DefaultAudioSink implements AudioSink {
   private long lastFeedElapsedRealtimeMs;
   private boolean offloadDisabledUntilNextConfiguration;
   private boolean isWaitingForOffloadEndOfStreamHandled;
+  private boolean forceReleaseOnNextFlush;
   @Nullable private Looper playbackLooper;
   private long skippedOutputFrameCountAtLastPosition;
   private long accumulatedSkippedSilenceDurationUs;
@@ -873,7 +874,7 @@ public final class DefaultAudioSink implements AudioSink {
           configuration = pendingConfiguration;
         } else {
           // Discard unused pre-warmed AudioTrack immediately so the new format takes over.
-          flush();
+          flushInternal(/* forceRelease= */ true);
           configuration = pendingConfiguration;
         }
       } else {
@@ -955,6 +956,7 @@ public final class DefaultAudioSink implements AudioSink {
           new OnRoutingChangedListenerApi24(audioTrack, audioCapabilitiesReceiver);
     }
     startMediaTimeUsNeedsInit = true;
+    forceReleaseOnNextFlush = false;
 
     int newAudioSessionId = audioTrack.getAudioSessionId();
     boolean audioSessionIdChanged = newAudioSessionId != audioSessionId;
@@ -1008,7 +1010,7 @@ public final class DefaultAudioSink implements AudioSink {
           // We're waiting for playout on the current audio track to finish.
           return false;
         }
-        flush();
+        flushInternal(/* forceRelease= */ true);
       } else {
         // The current audio track can be reused for the new configuration.
         configuration = pendingConfiguration;
@@ -1146,7 +1148,7 @@ public final class DefaultAudioSink implements AudioSink {
 
     if (audioTrackPositionTracker.isStalled(getWrittenFrames())) {
       Log.w(TAG, "Resetting stalled audio track");
-      flush();
+      flushInternal(/* forceRelease= */ true);
       return true;
     }
 
@@ -1377,6 +1379,7 @@ public final class DefaultAudioSink implements AudioSink {
 
     if (bytesWrittenOrError < 0) {
       int error = bytesWrittenOrError;
+      forceReleaseOnNextFlush = true;
 
       // Treat a write error on a previously successful offload channel as recoverable
       // without disabling offload. Offload will be disabled if offload channel was not successfully
@@ -1523,7 +1526,7 @@ public final class DefaultAudioSink implements AudioSink {
     if (audioCapabilitiesReceiver != null) {
       audioCapabilitiesReceiver.setAudioAttributes(audioAttributes);
     }
-    flush();
+    flushInternal(/* forceRelease= */ true);
   }
 
   @Override
@@ -1543,7 +1546,7 @@ public final class DefaultAudioSink implements AudioSink {
     if (this.audioSessionId != audioSessionId) {
       this.audioSessionId = audioSessionId;
       externalAudioSessionIdProvided = audioSessionId != C.AUDIO_SESSION_ID_UNSET;
-      flush();
+      flushInternal(/* forceRelease= */ true);
     }
   }
 
@@ -1599,7 +1602,7 @@ public final class DefaultAudioSink implements AudioSink {
     Assertions.checkState(externalAudioSessionIdProvided);
     if (!tunneling) {
       tunneling = true;
-      flush();
+      flushInternal(/* forceRelease= */ true);
     }
   }
 
@@ -1607,7 +1610,7 @@ public final class DefaultAudioSink implements AudioSink {
   public void disableTunneling() {
     if (tunneling) {
       tunneling = false;
-      flush();
+      flushInternal(/* forceRelease= */ true);
     }
   }
 
@@ -1656,31 +1659,40 @@ public final class DefaultAudioSink implements AudioSink {
 
   @Override
   public void flush() {
-    if (isAudioTrackInitialized()) {
-      resetSinkStateForFlush();
+    flushInternal(/* forceRelease= */ false);
+  }
 
-      if (audioTrackPositionTracker.isPlaying()) {
-        audioTrack.pause();
+  private void flushInternal(boolean forceRelease) {
+    boolean shouldForceRelease = forceRelease || forceReleaseOnNextFlush;
+    forceReleaseOnNextFlush = false;
+    if (isAudioTrackInitialized()) {
+      boolean reused = !shouldForceRelease && tryFlushPassthroughAudioTrackForReuse();
+      if (!reused) {
+        resetSinkStateForFlush();
+
+        if (audioTrackPositionTracker.isPlaying()) {
+          audioTrack.pause();
+        }
+        if (isOffloadedPlayback(audioTrack)) {
+          checkNotNull(offloadStreamEventCallbackV29).unregister(audioTrack);
+        }
+        boolean isPassthrough = configuration.outputMode == OUTPUT_MODE_PASSTHROUGH;
+        AudioTrackConfig oldAudioTrackConfig = configuration.buildAudioTrackConfig();
+        if (pendingConfiguration != null) {
+          configuration = pendingConfiguration;
+          pendingConfiguration = null;
+        }
+        audioTrackPositionTracker.reset();
+        if (SDK_INT >= 24 && onRoutingChangedListener != null) {
+          onRoutingChangedListener.release();
+          onRoutingChangedListener = null;
+        }
+        // We need to release the audio track on every flush because of known issues on some devices
+        // See b/7941810 or b/19193985.
+        // TODO: b/143500232 - Experiment with not releasing AudioTrack on flush.
+        releaseAudioTrackAsync(audioTrack, listener, oldAudioTrackConfig, isPassthrough);
+        audioTrack = null;
       }
-      if (isOffloadedPlayback(audioTrack)) {
-        checkNotNull(offloadStreamEventCallbackV29).unregister(audioTrack);
-      }
-      boolean isPassthrough = configuration.outputMode == OUTPUT_MODE_PASSTHROUGH;
-      AudioTrackConfig oldAudioTrackConfig = configuration.buildAudioTrackConfig();
-      if (pendingConfiguration != null) {
-        configuration = pendingConfiguration;
-        pendingConfiguration = null;
-      }
-      audioTrackPositionTracker.reset();
-      if (SDK_INT >= 24 && onRoutingChangedListener != null) {
-        onRoutingChangedListener.release();
-        onRoutingChangedListener = null;
-      }
-      // We need to release the audio track on every flush because of known issues on some devices
-      // See b/7941810 or b/19193985.
-      // TODO: b/143500232 - Experiment with not releasing AudioTrack on flush.
-      releaseAudioTrackAsync(audioTrack, listener, oldAudioTrackConfig, isPassthrough);
-      audioTrack = null;
     }
     writeExceptionPendingExceptionHolder.clear();
     initializationExceptionPendingExceptionHolder.clear();
@@ -1691,9 +1703,55 @@ public final class DefaultAudioSink implements AudioSink {
     }
   }
 
+  private boolean tryFlushPassthroughAudioTrackForReuse() {
+    if (!NuvioEngineConfig.get().isPassthroughAudioTrackReuseOnFlushEnabled()
+        || SDK_INT < 24
+        || audioTrack == null
+        || configuration == null
+        || configuration.outputMode != OUTPUT_MODE_PASSTHROUGH
+        || configuration.tunneling
+        || stoppedAudioTrack
+        || isOffloadedPlayback(audioTrack)) {
+      return false;
+    }
+    if (pendingConfiguration != null && !pendingConfiguration.canReuseAudioTrack(configuration)) {
+      return false;
+    }
+    if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+      return false;
+    }
+    try {
+      long preFlushHead = 0xFFFFFFFFL & audioTrack.getPlaybackHeadPosition();
+      if (audioTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+        audioTrack.pause();
+      }
+      audioTrack.flush();
+      if (pendingConfiguration != null) {
+        configuration = pendingConfiguration;
+        pendingConfiguration = null;
+      }
+      resetSinkStateForFlush();
+      startMediaTimeUsNeedsInit = true;
+      long postFlushHead = audioTrackPositionTracker.resetForReusedAudioTrack();
+      Log.i(
+          TAG,
+          "Reused passthrough AudioTrack on seek flush (encoding="
+              + configuration.outputEncoding
+              + ", preHead="
+              + preFlushHead
+              + ", postHead="
+              + postFlushHead
+              + ")");
+      return true;
+    } catch (IllegalStateException e) {
+      Log.w(TAG, "Passthrough AudioTrack reuse flush failed; falling back to recreate", e);
+      return false;
+    }
+  }
+
   @Override
   public void reset() {
-    flush();
+    flushInternal(/* forceRelease= */ true);
     for (AudioProcessor audioProcessor : availableAudioProcessors) {
       audioProcessor.reset();
     }
@@ -1727,6 +1785,7 @@ public final class DefaultAudioSink implements AudioSink {
             + ")");
     if (this.audioCapabilities != null && !audioCapabilities.equals(this.audioCapabilities)) {
       this.audioCapabilities = audioCapabilities;
+      forceReleaseOnNextFlush = true;
       if (listener != null) {
         listener.onAudioCapabilitiesChanged();
       }
