@@ -148,6 +148,19 @@ import java.lang.reflect.Method;
   private static final long MAX_LATENCY_US = 5 * C.MICROS_PER_SECOND;
 
   /**
+   * Maximum window after resuming a reused passthrough {@link AudioTrack} during which an
+   * implausibly large raw head (stale pre-flush HAL counter leaked while vendor {@code
+   * IStreamOut::flush} runs asynchronously on {@code play()}) is rejected.
+   */
+  private static final long REUSE_POST_FLUSH_HAL_GUARD_WINDOW_MS = 500L;
+
+  /**
+   * Maximum physically plausible initial head burst (including direct HAL DMA pre-drain) right
+   * after resuming a reused passthrough {@link AudioTrack}.
+   */
+  private static final long REUSE_POST_FLUSH_MAX_INITIAL_HEAD_BURST_US = 400_000L;
+
+  /**
    * The maximum offset between the expected position and the reported position to attempt
    * smoothing.
    */
@@ -227,6 +240,8 @@ import java.lang.reflect.Method;
    * raw head until either cleared on delayed reset to 0 or the track is released.
    */
   private long reusedTrackBaseRawHeadPosition;
+  private boolean awaitingPostFlushHalReset;
+  private long reusePlayStartTimeMs = C.TIME_UNSET;
 
   private Clock clock;
 
@@ -281,6 +296,8 @@ import java.lang.reflect.Method;
     expectRawPlaybackHeadReset = false;
     sumRawPlaybackHeadPosition = 0;
     reusedTrackBaseRawHeadPosition = 0;
+    awaitingPostFlushHalReset = false;
+    reusePlayStartTimeMs = C.TIME_UNSET;
     passthroughWorkaroundPauseOffset = 0;
     hasData = false;
     stopTimestampUs = C.TIME_UNSET;
@@ -385,6 +402,9 @@ import java.lang.reflect.Method;
   public void start() {
     if (stopTimestampUs != C.TIME_UNSET) {
       stopTimestampUs = msToUs(clock.elapsedRealtime());
+    }
+    if (awaitingPostFlushHalReset && reusePlayStartTimeMs == C.TIME_UNSET) {
+      reusePlayStartTimeMs = clock.elapsedRealtime();
     }
     onPositionAdvancingFromPositionUs = getPlaybackHeadPositionUs();
     checkNotNull(audioTimestampPoller).reset();
@@ -536,6 +556,8 @@ import java.lang.reflect.Method;
     long postFlushRawHead = 0xFFFFFFFFL & track.getPlaybackHeadPosition();
     rawPlaybackHeadPosition = postFlushRawHead;
     reusedTrackBaseRawHeadPosition = postFlushRawHead;
+    awaitingPostFlushHalReset = true;
+    reusePlayStartTimeMs = C.TIME_UNSET;
     rawPlaybackHeadWrapCount = 0;
     expectRawPlaybackHeadReset = false;
     sumRawPlaybackHeadPosition = 0;
@@ -560,6 +582,8 @@ import java.lang.reflect.Method;
   public void reset() {
     resetSyncParams();
     reusedTrackBaseRawHeadPosition = 0;
+    awaitingPostFlushHalReset = false;
+    reusePlayStartTimeMs = C.TIME_UNSET;
     audioTrack = null;
     audioTimestampPoller = null;
   }
@@ -635,10 +659,10 @@ import java.lang.reflect.Method;
 
     maybeUpdateLatency(systemTimeUs);
 
-    // When a reused passthrough AudioTrack kept a non-zero monotonic head across flush(), avoid
-    // polling AudioTimestamp until/unless the HAL resets its head to 0 so monotonic framePosition
-    // values cannot shift the post-seek clock forward on short seeks (<5s).
-    if (reusedTrackBaseRawHeadPosition == 0) {
+    // When a reused passthrough AudioTrack kept a non-zero monotonic head across flush(), or while
+    // waiting for an asynchronous vendor HAL flush-device on play(), avoid polling AudioTimestamp
+    // so stale pre-flush framePosition values cannot poison the post-seek clock.
+    if (reusedTrackBaseRawHeadPosition == 0 && !awaitingPostFlushHalReset) {
       checkNotNull(this.audioTimestampPoller)
           .maybePollTimestamp(
               systemTimeUs,
@@ -784,6 +808,29 @@ import java.lang.reflect.Method;
         passthroughWorkaroundPauseOffset = this.rawPlaybackHeadPosition;
       }
       rawPlaybackHeadPosition += passthroughWorkaroundPauseOffset;
+    }
+
+    if (awaitingPostFlushHalReset && state == PLAYSTATE_PLAYING) {
+      long elapsedSinceStartMs =
+          reusePlayStartTimeMs != C.TIME_UNSET ? max(0L, currentTimeMs - reusePlayStartTimeMs) : 0L;
+      long candidateFrames = max(0L, rawPlaybackHeadPosition - reusedTrackBaseRawHeadPosition);
+      long candidateUs = sampleCountToDurationUs(candidateFrames, outputSampleRate);
+      long maxPlausibleUs =
+          Util.getMediaDurationForPlayoutDuration(
+                  msToUs(elapsedSinceStartMs), audioTrackPlaybackSpeed)
+              + REUSE_POST_FLUSH_MAX_INITIAL_HEAD_BURST_US;
+      if (elapsedSinceStartMs < REUSE_POST_FLUSH_HAL_GUARD_WINDOW_MS
+          && candidateUs > maxPlausibleUs) {
+        // Vendor direct/offload HALs (e.g. Realtek AudioOut) execute HIDL IStreamOut::flush
+        // asynchronously after AudioTrack.play() (~10-20 ms). Ignore any stale pre-flush head
+        // leaked during that flush-device window so it never poisons MediaCodecAudioRenderer's
+        // monotonic max() clock and freezes video.
+        return;
+      }
+      if (candidateFrames > 0 || elapsedSinceStartMs >= REUSE_POST_FLUSH_HAL_GUARD_WINDOW_MS) {
+        awaitingPostFlushHalReset = false;
+        reusePlayStartTimeMs = C.TIME_UNSET;
+      }
     }
 
     if (SDK_INT <= 29 && reusedTrackBaseRawHeadPosition == 0) {

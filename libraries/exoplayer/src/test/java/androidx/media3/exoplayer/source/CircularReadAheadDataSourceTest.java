@@ -490,6 +490,171 @@ public final class CircularReadAheadDataSourceTest {
     }
   }
 
+  @Test
+  public void closeDuringSlowUpstreamRead_withFactory_detachesAndStartsNextSeekImmediately()
+      throws Exception {
+    byte[] payload = createPatternBytes(1_500_000);
+    CountDownLatch slowReadEntered = new CountDownLatch(1);
+    CountDownLatch slowUpstreamClosed = new CountDownLatch(1);
+    AtomicBoolean slowInRead = new AtomicBoolean(false);
+    AtomicBoolean overlapDetected = new AtomicBoolean(false);
+    AtomicInteger factoryCreatedCount = new AtomicInteger(0);
+    AtomicInteger transferListenerAttachCount = new AtomicInteger(0);
+
+    TransferListener dummyListener =
+        new TransferListener() {
+          @Override
+          public void onTransferInitializing(DataSource source, DataSpec dataSpec, boolean isNetwork) {}
+
+          @Override
+          public void onTransferStart(DataSource source, DataSpec dataSpec, boolean isNetwork) {}
+
+          @Override
+          public void onBytesTransferred(
+              DataSource source, DataSpec dataSpec, boolean isNetwork, int bytesTransferred) {}
+
+          @Override
+          public void onTransferEnd(DataSource source, DataSpec dataSpec, boolean isNetwork) {}
+        };
+
+    DataSource slowFirstUpstream =
+        new DataSource() {
+          @Override
+          public void addTransferListener(TransferListener transferListener) {}
+
+          @Override
+          public long open(DataSpec dataSpec) {
+            return payload.length;
+          }
+
+          @Override
+          public int read(byte[] buffer, int offset, int length) {
+            slowInRead.set(true);
+            try {
+              slowReadEntered.countDown();
+              // Simulate a 300 ms stalled OkHttp TCP read that ignores interrupt until packet/FIN.
+              long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
+              while (System.nanoTime() < deadline) {
+                try {
+                  Thread.sleep(10);
+                } catch (InterruptedException ignored) {
+                  // Ignore interrupt just like blocking SocketInputStream.
+                }
+              }
+              return Math.min(length, 1024);
+            } finally {
+              slowInRead.set(false);
+            }
+          }
+
+          @Override
+          public Uri getUri() {
+            return TEST_URI;
+          }
+
+          @Override
+          public void close() {
+            if (slowInRead.get()) {
+              overlapDetected.set(true);
+              throw new IllegalStateException("Unbalanced enter/exit");
+            }
+            slowUpstreamClosed.countDown();
+          }
+        };
+
+    DataSource.Factory factory =
+        () -> {
+          factoryCreatedCount.incrementAndGet();
+          return new FakeSeekableDataSource(payload) {
+            @Override
+            public void addTransferListener(TransferListener transferListener) {
+              transferListenerAttachCount.incrementAndGet();
+            }
+          };
+        };
+
+    CircularReadAheadDataSource ds =
+        new CircularReadAheadDataSource(
+            slowFirstUpstream, factory, dummyListener, /* bufferBytes= */ 512 * 1024);
+    try {
+      ds.open(new DataSpec(TEST_URI));
+      assertThat(slowReadEntered.await(2, TimeUnit.SECONDS)).isTrue();
+
+      long closeStartMs = System.nanoTime() / 1_000_000L;
+      ds.close();
+      long closeElapsedMs = (System.nanoTime() / 1_000_000L) - closeStartMs;
+
+      // Must detach after ~15 ms instead of blocking for the full 300 ms slow TCP read!
+      assertThat(closeElapsedMs).isLessThan(150L);
+      assertThat(ds.getAsyncDetachCount()).isEqualTo(1L);
+
+      // Immediately open far seek position using a fresh DataSource from the factory.
+      int seekPos = 900_000;
+      long len = ds.open(new DataSpec.Builder().setUri(TEST_URI).setPosition(seekPos).build());
+      assertThat(len).isEqualTo(payload.length - seekPos);
+      assertThat(factoryCreatedCount.get()).isEqualTo(1);
+      assertThat(transferListenerAttachCount.get()).isEqualTo(1);
+
+      byte[] seekData = readAllRemaining(ds);
+      assertRangeEquals(payload, seekPos, seekData);
+    } finally {
+      ds.release();
+    }
+
+    // Old detached worker must still close its own upstream cleanly with ZERO Okio overlap.
+    assertThat(slowUpstreamClosed.await(2, TimeUnit.SECONDS)).isTrue();
+    assertThat(overlapDetected.get()).isFalse();
+  }
+
+  @Test
+  public void lockFreeSpsc_alternatingFullAndEmptyTransitions_neverDeadlocksOrCorrupts()
+      throws Exception {
+    byte[] payload = createPatternBytes(1_200_000);
+    DataSource throttledUpstream =
+        new FakeSeekableDataSource(payload) {
+          private int calls;
+
+          @Override
+          public int read(byte[] buffer, int offset, int length) throws IOException {
+            // Periodically stall producer so consumer hits empty-ring wait, then burst so producer
+            // hits full-ring wait.
+            if ((++calls % 5) == 0) {
+              try {
+                Thread.sleep(3);
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new java.io.InterruptedIOException();
+              }
+            }
+            return super.read(buffer, offset, Math.min(length, 32 * 1024));
+          }
+        };
+
+    CircularReadAheadDataSource ds =
+        new CircularReadAheadDataSource(throttledUpstream, /* bufferBytes= */ 512 * 1024);
+    try {
+      ds.open(new DataSpec(TEST_URI));
+      byte[] actual = new byte[payload.length];
+      int offset = 0;
+      int reads = 0;
+      while (offset < payload.length) {
+        int want = Math.min((reads % 3 == 0) ? 184 : 4096, payload.length - offset);
+        int read = ds.read(actual, offset, want);
+        assertThat(read).isGreaterThan(0);
+        offset += read;
+        reads++;
+        // Periodically pause consumer so producer fills ring and parks in readerWaiting.
+        if (reads == 20 || reads == 150) {
+          Thread.sleep(25);
+        }
+      }
+      assertThat(ds.read(new byte[16], 0, 16)).isEqualTo(C.RESULT_END_OF_INPUT);
+      assertThat(actual).isEqualTo(payload);
+    } finally {
+      ds.release();
+    }
+  }
+
   private static byte[] createPatternBytes(int length) {
     byte[] data = new byte[length];
     for (int i = 0; i < length; i++) {
@@ -527,7 +692,7 @@ public final class CircularReadAheadDataSourceTest {
     }
   }
 
-  private static final class FakeSeekableDataSource implements DataSource {
+  private static class FakeSeekableDataSource implements DataSource {
     private final byte[] data;
     final AtomicInteger openCount = new AtomicInteger();
     final AtomicInteger closeCount = new AtomicInteger();

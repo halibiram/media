@@ -1,0 +1,30 @@
+# Baseline Profile rules for Nuvio decoupled ExoPlayer playback hot paths.
+# AOT-compiled at install time (HPL = hot + post-startup, avoids bloating cold app-launch DEX).
+
+# Real-time playback thread
+Landroidx/media3/exoplayer/PlaybackRealtimeThread*;
+HPLandroidx/media3/exoplayer/PlaybackRealtimeThread*;->**(**)**
+
+# Decoupled lock-free audio sink and passthrough seek-reuse audio path
+Landroidx/media3/exoplayer/audio/AsyncAudioSink*;
+HPLandroidx/media3/exoplayer/audio/AsyncAudioSink*;->**(**)**
+Landroidx/media3/exoplayer/audio/DefaultAudioSink*;
+HPLandroidx/media3/exoplayer/audio/DefaultAudioSink*;->**(**)**
+Landroidx/media3/exoplayer/audio/AudioTrackPositionTracker*;
+HPLandroidx/media3/exoplayer/audio/AudioTrackPositionTracker*;->**(**)**
+
+# Off-heap circular read-ahead data source and native sample queue
+Landroidx/media3/exoplayer/source/CircularReadAheadDataSource*;
+HPLandroidx/media3/exoplayer/source/CircularReadAheadDataSource*;->**(**)**
+Landroidx/media3/exoplayer/source/SampleDataQueueNative*;
+HPLandroidx/media3/exoplayer/source/SampleDataQueueNative*;->**(**)**
+Landroidx/media3/exoplayer/source/SampleDataQueue*;
+HPLandroidx/media3/exoplayer/source/SampleDataQueue*;->**(**)**
+
+# Asynchronous MediaCodec buffer enqueue/release pipeline
+Landroidx/media3/exoplayer/mediacodec/AsynchronousMediaCodecAdapter*;
+HPLandroidx/media3/exoplayer/mediacodec/AsynchronousMediaCodecAdapter*;->**(**)**
+Landroidx/media3/exoplayer/mediacodec/AsynchronousMediaCodecBufferEnqueuer*;
+HPLandroidx/media3/exoplayer/mediacodec/AsynchronousMediaCodecBufferEnqueuer*;->**(**)**
+Landroidx/media3/exoplayer/mediacodec/AsynchronousMediaCodecBufferReleaser*;
+HPLandroidx/media3/exoplayer/mediacodec/AsynchronousMediaCodecBufferReleaser*;->**(**)**

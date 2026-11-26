@@ -411,7 +411,9 @@ public final class ProgressiveMediaSource extends BaseMediaSource
     if (circularReadAheadBytes > 0
         && singleTrackFormat == null
         && CircularReadAheadDataSource.shouldWrap(localConfiguration.uri, dataSource)) {
-      dataSource = new CircularReadAheadDataSource(dataSource, circularReadAheadBytes);
+      dataSource =
+          new CircularReadAheadDataSource(
+              dataSource, dataSourceFactory, transferListener, circularReadAheadBytes);
     }
     return new ProgressiveMediaPeriod(
         localConfiguration.uri,

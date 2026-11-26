@@ -1,0 +1,5 @@
+# Baseline Profile rules for Nuvio Media3 common engine configuration and zero-copy interfaces.
+Landroidx/media3/common/NuvioEngineConfig*;
+HSPLandroidx/media3/common/NuvioEngineConfig*;->**(**)**
+Landroidx/media3/common/ByteBufferDataReader;
+HPLandroidx/media3/common/ByteBufferDataReader;->**(**)**

@@ -34,12 +34,14 @@ import androidx.media3.datasource.TransferListener;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Kodi-inspired off-heap circular RAM read-ahead {@link DataSource} decorator for progressive media
@@ -52,11 +54,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       partitioned into 75% forward read-ahead and 25% backward history, eliminating JVM heap GC
  *       churn on high-bitrate 4K streams.
  *   <li>Decouples extractor small reads (e.g. 184-byte Matroska EBML header reads) from upstream
- *       I/O by pumping upstream in large adaptive chunks ({@code 64 KB -> 128 KB -> 256 KB}) on a
- *       low-priority background reader thread.
+ *       I/O by pumping upstream in large adaptive chunks ({@code 16 KB -> 64 KB -> 128 KB -> 256
+ *       KB}) on a background reader thread, with a lock-free SPSC volatile fast path on steady
+ *       reads/writes.
  *   <li>Retains the cached byte window across {@link #close()} / {@link #open(DataSpec)} calls for
  *       the same URI so short back-seeks, forward in-buffer seeks, and track switches inside the
  *       ring resume in 0 ms from RAM while reconnecting upstream asynchronously at the cache tail.
+ *   <li>When constructed with a {@link DataSource.Factory}, detaches slow in-flight network reads
+ *       asynchronously on seek {@link #close()} (after a brief fast-join grace window) so the new
+ *       seek HTTP request launches immediately without blocking for 400-550 ms while still strictly
+ *       serializing {@code read()} and {@code close()} per {@link DataSource} instance (preventing
+ *       OkHttp/Okio {@code AsyncTimeout} overlap crashes).
  *   <li>Implements {@link ByteBufferDataReader} so downstream {@link SampleDataQueue} off-heap
  *       native chunks can copy directly from the direct ring buffer without intermediate {@code
  *       byte[]} copies.
@@ -75,6 +83,16 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
 
   private static final int MAX_CONSECUTIVE_ZERO_READS = 8;
 
+  /**
+   * Brief join window before detaching a slow in-flight network read during seek {@link #close()}.
+   * Idle/parked or local workers exit within ~1 ms and reuse the existing {@link DataSource}; slow
+   * remote TCP reads detach after 15 ms so the next seek starts immediately.
+   */
+  /* package */ static final long FAST_JOIN_TIMEOUT_MS = 15L;
+
+  /** Maximum concurrent detached workers draining old HTTP sockets during rapid D-pad scrubbing. */
+  /* package */ static final int MAX_DETACHED_WORKERS = 2;
+
   /** Initial upstream chunk size after open/seek to keep startup probes and seeks instantaneous. */
   /* package */ static final int INITIAL_CHUNK_BYTES = 16 * 1024;
 
@@ -87,12 +105,50 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   /** Steady-state upstream chunk size to coalesce small reads and saturate high-bitrate links. */
   /* package */ static final int STEADY_CHUNK_BYTES = 256 * 1024;
 
-  private final DataSource upstream;
+  /** Per-reader-run ownership capsule so a detached worker never touches live ring/upstream state. */
+  private static final class ReaderSession {
+    final DataSource upstream;
+    final AtomicBoolean upstreamOpen;
+    final boolean directRingWrite;
+    volatile boolean canceled;
+    boolean detached;
+    boolean exited;
+
+    ReaderSession(DataSource upstream, AtomicBoolean upstreamOpen, boolean directRingWrite) {
+      this.upstream = upstream;
+      this.upstreamOpen = upstreamOpen;
+      this.directRingWrite = directRingWrite;
+    }
+
+    void closeUpstreamQuietly() {
+      if (upstreamOpen.compareAndSet(true, false)) {
+        try {
+          upstream.close();
+        } catch (IOException | RuntimeException ignored) {
+          // Ignored when unwinding reader.
+        }
+      }
+    }
+  }
+
+  @Nullable private final DataSource.Factory upstreamFactory;
+  private final List<TransferListener> transferListeners = new ArrayList<>(2);
   private final int capacity;
   private final int backReserveBytes;
   private final int maxForwardBytes;
   private final int minWakeupRoomBytes;
   private final Object lock = new Object();
+  /**
+   * Uncontended fence lock held only while copying a fetched chunk into {@link #ringBuffer} (never
+   * held during network I/O or consumer reads). Acquiring this fence during {@link #close()}
+   * guarantees a detached worker will never touch {@link #ringBuffer} again.
+   */
+  private final Object ringWriteLock = new Object();
+
+  private final AtomicInteger activeDetachedWorkers = new AtomicInteger(0);
+
+  @Nullable private DataSource currentUpstream;
+  private AtomicBoolean currentUpstreamOpen = new AtomicBoolean(false);
 
   @Nullable private ByteBuffer ringBuffer;
   @Nullable private ByteBuffer consumerRingView;
@@ -104,7 +160,7 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   private boolean passthroughMode;
   private long openEndPos = C.LENGTH_UNSET;
   @Nullable private Thread readerThread;
-  private final AtomicBoolean upstreamOpen = new AtomicBoolean(false);
+  @Nullable private ReaderSession activeSession;
 
   // Cached metadata retained across close()/open() for in-buffer seek hits.
   @Nullable private DataSpec cachedRequestSpec;
@@ -112,24 +168,19 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   private Map<String, List<String>> responseHeaders = Collections.emptyMap();
   private long totalStreamLength = C.LENGTH_UNSET;
 
-  // Ring window state guarded by lock.
-  @GuardedBy("lock")
-  private long validStart;
-
-  @GuardedBy("lock")
-  private long readPos;
-
-  @GuardedBy("lock")
-  private long writePos;
+  // Lock-free SPSC ring indices (single producer updates writePos; single consumer updates
+  // validStart and readPos; Dekker wait flags synchronize parking/waking via lock).
+  private volatile long validStart;
+  private volatile long readPos;
+  private volatile long writePos;
+  private volatile boolean readerWaiting;
+  private volatile boolean consumerWaiting;
 
   @GuardedBy("lock")
   private boolean reachedEof;
 
   @GuardedBy("lock")
   private boolean stopRequested;
-
-  @GuardedBy("lock")
-  private boolean readerWaiting;
 
   @GuardedBy("lock")
   private boolean readerExited;
@@ -142,6 +193,7 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   private volatile long cacheHitOpenCount;
   private volatile long upstreamOpenCount;
   private volatile long upstreamReadCallCount;
+  private volatile long asyncDetachCount;
   private volatile long readerThreadCpuNs;
 
   /**
@@ -179,13 +231,38 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   }
 
   /**
-   * Creates a circular read-ahead wrapper around {@code upstream}.
+   * Creates a circular read-ahead wrapper around a single {@code upstream} {@link DataSource}.
    *
    * @param upstream The underlying {@link DataSource}.
    * @param bufferBytes Total ring buffer capacity in bytes (75% forward, 25% back).
    */
   public CircularReadAheadDataSource(DataSource upstream, int bufferBytes) {
-    this.upstream = Assertions.checkNotNull(upstream);
+    this(upstream, /* upstreamFactory= */ null, /* initialTransferListener= */ null, bufferBytes);
+  }
+
+  /**
+   * Creates a circular read-ahead wrapper with an optional {@link DataSource.Factory} so slow
+   * in-flight HTTP reads can be detached asynchronously on seek {@link #close()} without blocking
+   * the next seek request.
+   *
+   * @param initialUpstream The initial underlying {@link DataSource} (already configured with
+   *     {@code initialTransferListener}, if any).
+   * @param upstreamFactory Optional factory used to create fresh {@link DataSource} instances after
+   *     an async seek detach.
+   * @param initialTransferListener Optional transfer listener already attached to {@code
+   *     initialUpstream}, remembered so future factory-created upstreams receive it too.
+   * @param bufferBytes Total ring buffer capacity in bytes (75% forward, 25% back).
+   */
+  public CircularReadAheadDataSource(
+      DataSource initialUpstream,
+      @Nullable DataSource.Factory upstreamFactory,
+      @Nullable TransferListener initialTransferListener,
+      int bufferBytes) {
+    this.currentUpstream = Assertions.checkNotNull(initialUpstream);
+    this.upstreamFactory = upstreamFactory;
+    if (initialTransferListener != null) {
+      this.transferListeners.add(initialTransferListener);
+    }
     this.capacity = min(MAX_BUFFER_BYTES, max(MIN_BUFFER_BYTES, bufferBytes));
     this.backReserveBytes = this.capacity / 4;
     this.maxForwardBytes = this.capacity - this.backReserveBytes;
@@ -195,7 +272,12 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   @Override
   public void addTransferListener(TransferListener transferListener) {
     Assertions.checkNotNull(transferListener);
-    upstream.addTransferListener(transferListener);
+    if (!transferListeners.contains(transferListener)) {
+      transferListeners.add(transferListener);
+    }
+    if (currentUpstream != null) {
+      currentUpstream.addTransferListener(transferListener);
+    }
   }
 
   @Override
@@ -205,18 +287,7 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
     }
 
     if (shouldBypass(dataSpec) || !tryEnsureRingAllocated()) {
-      passthroughMode = true;
-      opened = true;
-      upstreamOpenCount++;
-      upstreamOpen.set(true);
-      try {
-        return upstream.open(dataSpec);
-      } catch (IOException | RuntimeException e) {
-        closeUpstreamQuietly();
-        opened = false;
-        passthroughMode = false;
-        throw e;
-      }
+      return openDirectPassthrough(dataSpec);
     }
 
     // Kodi-style in-buffer seek / track-switch hit: serve buffered bytes immediately from RAM and
@@ -230,7 +301,9 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       synchronized (lock) {
         readPos = startPos;
         stopRequested = false;
-        readerExited = !(!reachedEof);
+        readerWaiting = false;
+        consumerWaiting = false;
+        readerExited = reachedEof;
         readerError = null;
         needBackgroundContinuation = !reachedEof;
         continuationPos = writePos;
@@ -241,9 +314,10 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       cacheHitOpenCount++;
 
       if (needBackgroundContinuation) {
+        DataSource upstream = ensureUpstream();
         DataSpec continuationSpec =
             dataSpec.buildUpon().setPosition(continuationPos).setLength(C.LENGTH_UNSET).build();
-        if (!tryStartReaderThread(/* lazyOpenSpec= */ continuationSpec)) {
+        if (!tryStartReaderThread(upstream, currentUpstreamOpen, /* lazyOpenSpec= */ continuationSpec)) {
           // Thread creation OOM: fall through to direct synchronous open at requested startPos.
           opened = false;
           invalidateCacheLocked();
@@ -255,14 +329,15 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
 
     // Cache miss: open upstream synchronously so HTTP errors, redirects, and response headers
     // behave identically to stock DataSource.
+    DataSource upstream = ensureUpstream();
     upstreamOpenCount++;
-    upstreamOpen.set(true);
+    currentUpstreamOpen.set(true);
     long openedLength;
     try {
       openedLength = upstream.open(dataSpec);
     } catch (IOException | RuntimeException e) {
       // Honor DataSource contract: always close upstream after a failed open() attempt.
-      closeUpstreamQuietly();
+      closeCurrentUpstreamQuietly();
       invalidateCacheLocked();
       throw e;
     }
@@ -287,6 +362,8 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       validStart = dataSpec.position;
       readPos = dataSpec.position;
       writePos = dataSpec.position;
+      readerWaiting = false;
+      consumerWaiting = false;
       reachedEof = immediateEof;
       stopRequested = false;
       readerExited = immediateEof;
@@ -296,7 +373,8 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
     passthroughMode = false;
     opened = true;
 
-    if (!immediateEof && !tryStartReaderThread(/* lazyOpenSpec= */ null)) {
+    if (!immediateEof
+        && !tryStartReaderThread(upstream, currentUpstreamOpen, /* lazyOpenSpec= */ null)) {
       // Thread creation OOM: upstream is already open at dataSpec.position, so seamlessly serve
       // this session in direct passthrough mode without failing playback!
       passthroughMode = true;
@@ -306,18 +384,31 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   }
 
   private long openDirectPassthrough(DataSpec dataSpec) throws IOException {
+    DataSource upstream = ensureUpstream();
     passthroughMode = true;
     opened = true;
     upstreamOpenCount++;
-    upstreamOpen.set(true);
+    currentUpstreamOpen.set(true);
     try {
       return upstream.open(dataSpec);
     } catch (IOException | RuntimeException e) {
-      closeUpstreamQuietly();
+      closeCurrentUpstreamQuietly();
       opened = false;
       passthroughMode = false;
       throw e;
     }
+  }
+
+  private DataSource ensureUpstream() {
+    if (currentUpstream == null) {
+      DataSource created = Assertions.checkNotNull(upstreamFactory).createDataSource();
+      for (int i = 0; i < transferListeners.size(); i++) {
+        created.addTransferListener(transferListeners.get(i));
+      }
+      currentUpstream = created;
+      currentUpstreamOpen = new AtomicBoolean(false);
+    }
+    return currentUpstream;
   }
 
   @Override
@@ -329,17 +420,24 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       throw new IOException("CircularReadAheadDataSource is not open");
     }
     if (passthroughMode) {
-      return upstream.read(buffer, offset, length);
+      return Assertions.checkNotNull(currentUpstream).read(buffer, offset, length);
     }
 
-    long readStartPos;
+    // Lock-free SPSC fast path: volatile read of writePos establishes happens-before with the
+    // producer's writes into ringBuffer.
+    long readStartPos = readPos;
+    long available = writePos - readStartPos;
     int toRead;
-    synchronized (lock) {
-      toRead = awaitAvailableBytesLocked(length);
-      if (toRead == C.RESULT_END_OF_INPUT) {
-        return C.RESULT_END_OF_INPUT;
+    if (available > 0) {
+      toRead = (int) min(length, available);
+    } else {
+      synchronized (lock) {
+        toRead = awaitAvailableBytesLocked(length);
+        if (toRead == C.RESULT_END_OF_INPUT) {
+          return C.RESULT_END_OF_INPUT;
+        }
+        readStartPos = readPos;
       }
-      readStartPos = readPos;
     }
 
     copyFromRingToArray(readStartPos, buffer, offset, toRead);
@@ -350,8 +448,8 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   @Override
   public boolean supportsByteBufferRead() {
     if (passthroughMode) {
-      return upstream instanceof ByteBufferDataReader
-          && ((ByteBufferDataReader) upstream).supportsByteBufferRead();
+      return currentUpstream instanceof ByteBufferDataReader
+          && ((ByteBufferDataReader) currentUpstream).supportsByteBufferRead();
     }
     return true;
   }
@@ -365,11 +463,11 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       throw new IOException("CircularReadAheadDataSource is not open");
     }
     if (passthroughMode) {
-      if (!(upstream instanceof ByteBufferDataReader)
-          || !((ByteBufferDataReader) upstream).supportsByteBufferRead()) {
+      if (!(currentUpstream instanceof ByteBufferDataReader)
+          || !((ByteBufferDataReader) currentUpstream).supportsByteBufferRead()) {
         throw new UnsupportedOperationException();
       }
-      return ((ByteBufferDataReader) upstream).read(target, length);
+      return ((ByteBufferDataReader) currentUpstream).read(target, length);
     }
 
     int maxRead = min(length, target.remaining());
@@ -377,14 +475,19 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       return 0;
     }
 
-    long readStartPos;
+    long readStartPos = readPos;
+    long available = writePos - readStartPos;
     int toRead;
-    synchronized (lock) {
-      toRead = awaitAvailableBytesLocked(maxRead);
-      if (toRead == C.RESULT_END_OF_INPUT) {
-        return C.RESULT_END_OF_INPUT;
+    if (available > 0) {
+      toRead = (int) min(maxRead, available);
+    } else {
+      synchronized (lock) {
+        toRead = awaitAvailableBytesLocked(maxRead);
+        if (toRead == C.RESULT_END_OF_INPUT) {
+          return C.RESULT_END_OF_INPUT;
+        }
+        readStartPos = readPos;
       }
-      readStartPos = readPos;
     }
 
     copyFromRingToByteBuffer(readStartPos, target, toRead);
@@ -396,21 +499,33 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   @Nullable
   public Uri getUri() {
     if (passthroughMode) {
-      return upstream.getUri();
+      return currentUpstream != null ? currentUpstream.getUri() : null;
     }
-    return opened ? (resolvedUri != null ? resolvedUri : upstream.getUri()) : null;
+    if (!opened) {
+      return null;
+    }
+    if (resolvedUri != null) {
+      return resolvedUri;
+    }
+    return currentUpstream != null ? currentUpstream.getUri() : null;
   }
 
   @Override
   public Map<String, List<String>> getResponseHeaders() {
     if (passthroughMode) {
-      return upstream.getResponseHeaders();
+      return currentUpstream != null
+          ? currentUpstream.getResponseHeaders()
+          : Collections.emptyMap();
     }
     return opened ? responseHeaders : Collections.emptyMap();
   }
 
   @Override
   public void close() throws IOException {
+    closeInternal(/* allowAsyncDetach= */ true);
+  }
+
+  private void closeInternal(boolean allowAsyncDetach) throws IOException {
     if (!opened) {
       return;
     }
@@ -418,7 +533,7 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
 
     if (passthroughMode) {
       passthroughMode = false;
-      IOException closeException = closeUpstreamReturningException();
+      IOException closeException = closeCurrentUpstreamReturningException();
       if (closeException != null) {
         throw closeException;
       }
@@ -426,28 +541,78 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
     }
 
     Thread worker;
+    ReaderSession session;
     boolean hadError;
     synchronized (lock) {
       stopRequested = true;
       hadError = readerError != null;
       worker = readerThread;
       readerThread = null;
+      session = activeSession;
+      activeSession = null;
+      if (session != null) {
+        session.canceled = true;
+      }
       lock.notifyAll();
     }
 
+    boolean detached = false;
     if (worker != null) {
       worker.interrupt();
+      boolean canDetach =
+          allowAsyncDetach
+              && upstreamFactory != null
+              && session != null
+              && !session.directRingWrite
+              && tryReserveDetachedSlot();
       boolean wasInterrupted = Thread.interrupted();
       try {
-        // Strictly serialize upstream ownership: never call upstream.close() concurrently with
-        // an in-flight upstream.read() on another thread (OkHttp/Okio AsyncTimeout throws
-        // IllegalStateException("Unbalanced enter/exit") if read() and close() overlap).
-        // The worker always closes upstream in its own finally block before exiting.
-        while (worker.isAlive()) {
-          try {
-            worker.join();
-          } catch (InterruptedException ignored) {
-            wasInterrupted = true;
+        if (canDetach) {
+          // Wait briefly for idle/fast workers to exit cleanly and reuse the existing DataSource.
+          long deadlineNs = System.nanoTime() + FAST_JOIN_TIMEOUT_MS * 1_000_000L;
+          while (worker.isAlive()) {
+            long remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000L;
+            if (remainingMs <= 0L) {
+              break;
+            }
+            try {
+              worker.join(remainingMs);
+            } catch (InterruptedException ignored) {
+              wasInterrupted = true;
+            }
+          }
+          if (worker.isAlive()) {
+            // Fence against any in-flight copy into ringBuffer (~50 us max) and coordinate exact
+            // detach handoff with the worker's finally block so activeDetachedWorkers can never
+            // leak a slot even if the worker exits concurrently.
+            synchronized (ringWriteLock) {
+              if (!session.exited) {
+                session.detached = true;
+                detached = true;
+              }
+            }
+          }
+          if (detached) {
+            // Relinquish ownership of both currentUpstream and stagingBuffer to the detached worker
+            // so the next seek immediately opens a fresh DataSource with zero Okio overlap.
+            currentUpstream = null;
+            currentUpstreamOpen = new AtomicBoolean(false);
+            stagingBuffer = null;
+            asyncDetachCount++;
+          } else {
+            // Worker exited before detach; release the unused slot and reuse currentUpstream.
+            activeDetachedWorkers.decrementAndGet();
+          }
+        } else {
+          // Strictly serialize upstream ownership: never call upstream.close() concurrently with
+          // an in-flight upstream.read() on another thread (OkHttp/Okio AsyncTimeout throws
+          // IllegalStateException("Unbalanced enter/exit") if read() and close() overlap).
+          while (worker.isAlive()) {
+            try {
+              worker.join();
+            } catch (InterruptedException ignored) {
+              wasInterrupted = true;
+            }
           }
         }
       } finally {
@@ -457,7 +622,7 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       }
     }
 
-    IOException closeException = closeUpstreamReturningException();
+    IOException closeException = detached ? null : closeCurrentUpstreamReturningException();
 
     if (hadError) {
       synchronized (lock) {
@@ -476,13 +641,25 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
     }
   }
 
+  private boolean tryReserveDetachedSlot() {
+    while (true) {
+      int current = activeDetachedWorkers.get();
+      if (current >= MAX_DETACHED_WORKERS) {
+        return false;
+      }
+      if (activeDetachedWorkers.compareAndSet(current, current + 1)) {
+        return true;
+      }
+    }
+  }
+
   /**
    * Releases the off-heap ring buffer and cached metadata once the owning {@link
    * ProgressiveMediaPeriod} is permanently released.
    */
   public void release() {
     try {
-      close();
+      closeInternal(/* allowAsyncDetach= */ true);
     } catch (IOException e) {
       Log.w(TAG, "Error closing CircularReadAheadDataSource during release", e);
     }
@@ -495,6 +672,8 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
               + upstreamOpenCount
               + " cacheHits="
               + cacheHitOpenCount
+              + " asyncDetaches="
+              + asyncDetachCount
               + " upstreamReads="
               + upstreamReadCallCount
               + " readerCPU="
@@ -505,6 +684,8 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       validStart = 0;
       readPos = 0;
       writePos = 0;
+      readerWaiting = false;
+      consumerWaiting = false;
       reachedEof = false;
       readerError = null;
     }
@@ -531,6 +712,11 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   /** Returns the number of upstream {@link DataSource#read} calls issued by the reader thread. */
   public long getUpstreamReadCallCount() {
     return upstreamReadCallCount;
+  }
+
+  /** Returns the number of slow in-flight network readers detached asynchronously during close. */
+  public long getAsyncDetachCount() {
+    return asyncDetachCount;
   }
 
   private boolean shouldBypass(DataSpec dataSpec) {
@@ -575,7 +761,10 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       readerRingView = allocated.duplicate();
       return true;
     } catch (OutOfMemoryError e) {
-      Log.w(TAG, "Direct ring buffer allocation (" + capacity + "B) OOM; falling back to direct passthrough", e);
+      Log.w(
+          TAG,
+          "Direct ring buffer allocation (" + capacity + "B) OOM; falling back to passthrough",
+          e);
       ringBuffer = null;
       consumerRingView = null;
       readerRingView = null;
@@ -588,6 +777,8 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       validStart = 0;
       readPos = 0;
       writePos = 0;
+      readerWaiting = false;
+      consumerWaiting = false;
       reachedEof = false;
       readerError = null;
     }
@@ -600,24 +791,38 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
     while (true) {
       long available = writePos - readPos;
       if (available > 0) {
+        consumerWaiting = false;
         return (int) min(requestedLength, available);
       }
       if (readerError != null) {
+        consumerWaiting = false;
         throw readerError;
       }
       if (reachedEof || (openEndPos != C.LENGTH_UNSET && readPos >= openEndPos)) {
+        consumerWaiting = false;
         return C.RESULT_END_OF_INPUT;
       }
       if (stopRequested) {
+        consumerWaiting = false;
         throw new InterruptedIOException("CircularReadAheadDataSource closed");
       }
       if (readerExited) {
+        consumerWaiting = false;
         // Defensive anti-hang guard: worker exited unexpectedly without setting EOF or error.
         return C.RESULT_END_OF_INPUT;
+      }
+      consumerWaiting = true;
+      // Dekker re-check after publishing consumerWaiting = true so a lock-free writePos update
+      // from the producer can never miss waking us up.
+      available = writePos - readPos;
+      if (available > 0) {
+        consumerWaiting = false;
+        return (int) min(requestedLength, available);
       }
       try {
         lock.wait();
       } catch (InterruptedException e) {
+        consumerWaiting = false;
         Thread.currentThread().interrupt();
         throw new InterruptedIOException("Interrupted while waiting for read-ahead data");
       }
@@ -625,23 +830,28 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   }
 
   private void advanceReadPos(long newReadPos) {
-    synchronized (lock) {
-      readPos = newReadPos;
-      long minValidStart = newReadPos - backReserveBytes;
-      if (minValidStart > validStart) {
-        validStart = minValidStart;
-      }
-      if (readerWaiting && computeWritableRoomLocked() >= minWakeupRoomBytes) {
-        readerWaiting = false;
-        lock.notifyAll();
+    long minValidStart = newReadPos - backReserveBytes;
+    if (minValidStart > validStart) {
+      validStart = minValidStart;
+    }
+    // Volatile publish of readPos AFTER ring copy completes and BEFORE checking readerWaiting.
+    readPos = newReadPos;
+    if (readerWaiting) {
+      synchronized (lock) {
+        if (readerWaiting && computeWritableRoom() >= minWakeupRoomBytes) {
+          readerWaiting = false;
+          lock.notifyAll();
+        }
       }
     }
   }
 
-  @GuardedBy("lock")
-  private long computeWritableRoomLocked() {
-    long forwardBuffered = writePos - readPos;
-    long usedBytes = writePos - validStart;
+  private long computeWritableRoom() {
+    long rPos = readPos;
+    long vStart = validStart;
+    long wPos = writePos;
+    long forwardBuffered = wPos - rPos;
+    long usedBytes = wPos - vStart;
     return min(maxForwardBytes - forwardBuffered, capacity - usedBytes);
   }
 
@@ -684,15 +894,33 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
     }
   }
 
-  private boolean tryStartReaderThread(@Nullable DataSpec lazyOpenSpec) {
+  private boolean tryStartReaderThread(
+      DataSource sessionUpstream,
+      AtomicBoolean sessionUpstreamOpen,
+      @Nullable DataSpec lazyOpenSpec) {
     ByteBuffer workerRingView = Assertions.checkNotNull(readerRingView);
+    boolean directRingWrite =
+        sessionUpstream instanceof ByteBufferDataReader
+            && ((ByteBufferDataReader) sessionUpstream).supportsByteBufferRead();
+    ReaderSession session =
+        new ReaderSession(sessionUpstream, sessionUpstreamOpen, directRingWrite);
+    byte[] localStaging = null;
+    if (!directRingWrite) {
+      localStaging = stagingBuffer;
+      if (localStaging == null || localStaging.length < STEADY_CHUNK_BYTES) {
+        localStaging = new byte[STEADY_CHUNK_BYTES];
+        stagingBuffer = localStaging;
+      }
+    }
+    final byte[] workerStaging = localStaging;
     Thread worker =
         new Thread(
-            () -> runReaderLoop(workerRingView, lazyOpenSpec),
+            () -> runReaderLoop(session, workerRingView, workerStaging, lazyOpenSpec),
             "ExoPlayer:CircularReadAhead");
     worker.setDaemon(true);
     synchronized (lock) {
       readerThread = worker;
+      activeSession = session;
       readerExited = false;
     }
     try {
@@ -702,13 +930,18 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
       Log.w(TAG, "Failed to start CircularReadAhead thread; falling back to passthrough", e);
       synchronized (lock) {
         readerThread = null;
+        activeSession = null;
         readerExited = true;
       }
       return false;
     }
   }
 
-  private void runReaderLoop(ByteBuffer workerRingView, @Nullable DataSpec lazyOpenSpec) {
+  private void runReaderLoop(
+      ReaderSession session,
+      ByteBuffer workerRingView,
+      @Nullable byte[] localStaging,
+      @Nullable DataSpec lazyOpenSpec) {
     long cpuStartNs = 0L;
     int currentPriority = Process.THREAD_PRIORITY_DEFAULT;
     try {
@@ -723,69 +956,72 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
 
     try {
       if (lazyOpenSpec != null) {
-        synchronized (lock) {
-          if (stopRequested) {
-            return;
-          }
+        if (session.canceled) {
+          return;
         }
         upstreamOpenCount++;
-        upstreamOpen.set(true);
-        long continuationLength = upstream.open(lazyOpenSpec);
+        session.upstreamOpen.set(true);
+        long continuationLength = session.upstream.open(lazyOpenSpec);
+        if (session.canceled) {
+          return;
+        }
         if (continuationLength == 0) {
           synchronized (lock) {
-            reachedEof = true;
-            lock.notifyAll();
+            if (!session.canceled) {
+              reachedEof = true;
+              lock.notifyAll();
+            }
           }
           return;
         }
       }
 
-      boolean upstreamSupportsByteBuffer =
-          upstream instanceof ByteBufferDataReader
-              && ((ByteBufferDataReader) upstream).supportsByteBufferRead();
-      byte[] localStaging = null;
-      if (!upstreamSupportsByteBuffer) {
-        localStaging = stagingBuffer;
-        if (localStaging == null || localStaging.length < STEADY_CHUNK_BYTES) {
-          localStaging = new byte[STEADY_CHUNK_BYTES];
-          stagingBuffer = localStaging;
-        }
-      }
-
       int chunkStep = 0;
       int consecutiveZeroReads = 0;
-      while (true) {
-        long currentWritePos = 0;
-        int maxWritable = 0;
-        long forwardBufferedSnapshot = 0;
-        synchronized (lock) {
-          while (!stopRequested) {
-            long allowed = computeWritableRoomLocked();
-            if (allowed >= minWakeupRoomBytes) {
-              readerWaiting = false;
-              currentWritePos = writePos;
-              forwardBufferedSnapshot = writePos - readPos;
-              int targetChunk;
-              if (chunkStep == 0) {
-                targetChunk = INITIAL_CHUNK_BYTES;
-              } else if (chunkStep == 1) {
-                targetChunk = RAMP_1_CHUNK_BYTES;
-              } else if (chunkStep == 2) {
-                targetChunk = RAMP_2_CHUNK_BYTES;
-              } else {
-                targetChunk = STEADY_CHUNK_BYTES;
+      while (!session.canceled) {
+        long currentWritePos = writePos;
+        long allowed = computeWritableRoom();
+        long forwardBufferedSnapshot = currentWritePos - readPos;
+        if (allowed < minWakeupRoomBytes) {
+          synchronized (lock) {
+            while (!stopRequested && !session.canceled) {
+              allowed = computeWritableRoom();
+              if (allowed >= minWakeupRoomBytes) {
+                readerWaiting = false;
+                currentWritePos = writePos;
+                forwardBufferedSnapshot = currentWritePos - readPos;
+                break;
               }
-              maxWritable = (int) min(allowed, targetChunk);
-              break;
+              readerWaiting = true;
+              // Dekker re-check after publishing readerWaiting = true to close any window with
+              // lock-free advanceReadPos().
+              allowed = computeWritableRoom();
+              if (allowed >= minWakeupRoomBytes) {
+                readerWaiting = false;
+                currentWritePos = writePos;
+                forwardBufferedSnapshot = currentWritePos - readPos;
+                break;
+              }
+              lock.wait();
             }
-            readerWaiting = true;
-            lock.wait();
-          }
-          readerWaiting = false;
-          if (stopRequested) {
-            return;
+            readerWaiting = false;
+            if (stopRequested || session.canceled) {
+              return;
+            }
           }
         }
+
+        int targetChunk;
+        if (chunkStep == 0) {
+          targetChunk = INITIAL_CHUNK_BYTES;
+        } else if (chunkStep == 1) {
+          targetChunk = RAMP_1_CHUNK_BYTES;
+        } else if (chunkStep == 2) {
+          targetChunk = RAMP_2_CHUNK_BYTES;
+        } else {
+          targetChunk = STEADY_CHUNK_BYTES;
+        }
+        int maxWritable = (int) min(allowed, targetChunk);
 
         int desiredPriority =
             forwardBufferedSnapshot < STEADY_CHUNK_BYTES
@@ -801,28 +1037,31 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
         }
 
         int bytesRead;
-        if (upstreamSupportsByteBuffer) {
+        if (session.directRingWrite) {
           int start = (int) (currentWritePos % capacity);
           int contiguous = min(maxWritable, capacity - start);
           workerRingView.limit(start + contiguous).position(start);
           upstreamReadCallCount++;
-          bytesRead = ((ByteBufferDataReader) upstream).read(workerRingView, contiguous);
+          bytesRead = ((ByteBufferDataReader) session.upstream).read(workerRingView, contiguous);
         } else {
           upstreamReadCallCount++;
-          bytesRead = upstream.read(Assertions.checkNotNull(localStaging), 0, maxWritable);
-          if (bytesRead > 0) {
-            copyFromArrayToRing(workerRingView, currentWritePos, localStaging, 0, bytesRead);
-          }
+          bytesRead = session.upstream.read(Assertions.checkNotNull(localStaging), 0, maxWritable);
+        }
+
+        if (session.canceled) {
+          return;
         }
 
         if (bytesRead == C.RESULT_END_OF_INPUT) {
           synchronized (lock) {
-            reachedEof = true;
-            if (totalStreamLength == C.LENGTH_UNSET && cachedRequestSpec != null) {
-              totalStreamLength = writePos;
-              openEndPos = writePos;
+            if (!session.canceled) {
+              reachedEof = true;
+              if (totalStreamLength == C.LENGTH_UNSET && cachedRequestSpec != null) {
+                totalStreamLength = writePos;
+                openEndPos = writePos;
+              }
+              lock.notifyAll();
             }
-            lock.notifyAll();
           }
           return;
         }
@@ -830,9 +1069,27 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
         if (bytesRead > 0) {
           consecutiveZeroReads = 0;
           chunkStep = min(chunkStep + 1, 3);
-          synchronized (lock) {
-            writePos += bytesRead;
-            lock.notifyAll();
+          if (session.directRingWrite) {
+            writePos = currentWritePos + bytesRead;
+          } else {
+            // Uncontended fence lock guarantees close() never detaches mid-copy into ringBuffer.
+            synchronized (ringWriteLock) {
+              if (session.canceled) {
+                return;
+              }
+              copyFromArrayToRing(
+                  workerRingView, currentWritePos, Assertions.checkNotNull(localStaging), 0, bytesRead);
+              writePos = currentWritePos + bytesRead;
+            }
+          }
+          // Lock-free publish complete; wake consumer only if it is parked waiting for bytes.
+          if (consumerWaiting) {
+            synchronized (lock) {
+              if (consumerWaiting) {
+                consumerWaiting = false;
+                lock.notifyAll();
+              }
+            }
           }
         } else {
           consecutiveZeroReads++;
@@ -845,19 +1102,23 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
     } catch (InterruptedException e) {
       // Expected on close().
     } catch (IOException e) {
-      synchronized (lock) {
-        if (!stopRequested) {
-          readerError = e;
-          lock.notifyAll();
+      if (!session.canceled) {
+        synchronized (lock) {
+          if (!stopRequested && !session.canceled) {
+            readerError = e;
+            lock.notifyAll();
+          }
         }
       }
     } catch (Throwable t) {
       // Catch RuntimeException AND Error (e.g. OutOfMemoryError) so consumer read() can NEVER
       // deadlock waiting on a dead worker thread.
-      synchronized (lock) {
-        if (!stopRequested) {
-          readerError = new IOException("Unexpected CircularReadAhead error", t);
-          lock.notifyAll();
+      if (!session.canceled) {
+        synchronized (lock) {
+          if (!stopRequested && !session.canceled) {
+            readerError = new IOException("Unexpected CircularReadAhead error", t);
+            lock.notifyAll();
+          }
         }
       }
     } finally {
@@ -871,16 +1132,30 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
           // Non-Android / Robolectric JVM.
         }
       }
-      closeUpstreamQuietly();
-      synchronized (lock) {
-        readerExited = true;
-        lock.notifyAll();
+      session.closeUpstreamQuietly();
+      // Coordinate detach decision with close() under ringWriteLock so we never leak an
+      // activeDetachedWorkers slot or clobber a new session's state.
+      boolean wasDetached;
+      synchronized (ringWriteLock) {
+        session.exited = true;
+        wasDetached = session.detached;
+      }
+      if (wasDetached) {
+        activeDetachedWorkers.decrementAndGet();
+      } else {
+        synchronized (lock) {
+          if (activeSession == session || activeSession == null) {
+            readerExited = true;
+            lock.notifyAll();
+          }
+        }
       }
     }
   }
 
-  private void closeUpstreamQuietly() {
-    if (upstreamOpen.compareAndSet(true, false)) {
+  private void closeCurrentUpstreamQuietly() {
+    DataSource upstream = currentUpstream;
+    if (upstream != null && currentUpstreamOpen.compareAndSet(true, false)) {
       try {
         upstream.close();
       } catch (IOException | RuntimeException ignored) {
@@ -890,8 +1165,9 @@ public final class CircularReadAheadDataSource implements DataSource, ByteBuffer
   }
 
   @Nullable
-  private IOException closeUpstreamReturningException() {
-    if (upstreamOpen.compareAndSet(true, false)) {
+  private IOException closeCurrentUpstreamReturningException() {
+    DataSource upstream = currentUpstream;
+    if (upstream != null && currentUpstreamOpen.compareAndSet(true, false)) {
       try {
         upstream.close();
       } catch (IOException e) {
